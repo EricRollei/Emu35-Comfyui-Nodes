@@ -673,9 +673,15 @@ class Emu35Sampler:
         # This is crucial for Emu 3.5
         logits_processor = LogitsProcessorList()
         
-        # Calculate required tokens: H * (W + 1) for EOL tokens
-        # Add some buffer for safety
-        needed_tokens = latent_height * (latent_width + 1) + 50
+        # Calculate required tokens: H * (W + 1) for EOL tokens + overhead for text, BOI, EOI, etc.
+        # The official config uses max_new_tokens=5120 which provides plenty of buffer.
+        # The model may generate text response BEFORE the image tokens.
+        # For 64x64 latents: 64 * 65 = 4160 image tokens, plus BOI, EOI, IMG, text response overhead
+        base_image_tokens = latent_height * (latent_width + 1)  # Image tokens with EOL
+        text_overhead = 500  # Buffer for text response before image, BOI, EOI, IMG tokens
+        needed_tokens = base_image_tokens + text_overhead
+        # Ensure at least 5120 as per official config
+        needed_tokens = max(needed_tokens, 5120)
         
         # Resolution tokens
         # Emu3 expects pixel resolution in the resolution string (e.g. "1024*1024")

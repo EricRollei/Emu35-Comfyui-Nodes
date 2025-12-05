@@ -698,18 +698,15 @@ class Emu35Sampler:
                     "BOS": tokenizer.bos_token_id,
                 }
 
-                # Sampling params - MUST match official configs/example_config_t2i.py
+                # Sampling params from config.py
                 self.sampling_params = {
                     "use_cache": True,
-                    # Text token sampling (more constrained)
                     "text_top_k": 1024,
                     "text_top_p": 0.9,
                     "text_temperature": 1.0,
-                    # Image token sampling (more diverse) 
-                    "image_top_k": 5120,  # Official uses 5120, not 10240!
+                    "image_top_k": 10240,
                     "image_top_p": 1.0,
                     "image_temperature": 1.0,
-                    # General defaults
                     "top_k": 131072,
                     "top_p": 1.0,
                     "temperature": 1.0,
@@ -717,9 +714,8 @@ class Emu35Sampler:
                     "num_beam_groups": 1,
                     "diversity_penalty": 0.0,
                     "max_new_tokens": needed_tokens,
-                    "guidance_scale": 1.0,  # This is different from CFG scale
-                    # Enable differential sampling - CRITICAL for quality!
-                    "use_differential_sampling": True,
+                    "guidance_scale": cfg_scale,
+                    "use_differential_sampling": True, # Default from config.py
                     "do_sample": True,
                     "num_beams": 1,
                 }
@@ -741,12 +737,16 @@ class Emu35Sampler:
             print("Continuing without custom logits processor - CFG will NOT be applied!")
             # Continue without it - may be faster without overhead
 
-        # Generation Config - match official generation_utils.py
-        # The official code does: GenerationConfig(**cfg.sampling_params, pad_token_id=..., eos_token_id=...)
+        # Generation Config
+        # For NF4 models, reduce memory pressure by using smaller batch internally
         generation_config = GenerationConfig(
-            **dummy_cfg.sampling_params,
+            max_new_tokens=needed_tokens,
             pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            do_sample=True,
+            temperature=1.0, 
+            top_k=10240, # Match image_top_k
         )
         
         # Fix for 'NoneType' object has no attribute 'transformers_version'

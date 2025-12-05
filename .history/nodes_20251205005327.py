@@ -741,12 +741,16 @@ class Emu35Sampler:
             print("Continuing without custom logits processor - CFG will NOT be applied!")
             # Continue without it - may be faster without overhead
 
-        # Generation Config - match official generation_utils.py
-        # The official code does: GenerationConfig(**cfg.sampling_params, pad_token_id=..., eos_token_id=...)
+        # Generation Config
+        # For NF4 models, reduce memory pressure by using smaller batch internally
         generation_config = GenerationConfig(
-            **dummy_cfg.sampling_params,
+            max_new_tokens=needed_tokens,
             pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            use_cache=True,
+            do_sample=True,
+            temperature=1.0, 
+            top_k=10240, # Match image_top_k
         )
         
         # Fix for 'NoneType' object has no attribute 'transformers_version'

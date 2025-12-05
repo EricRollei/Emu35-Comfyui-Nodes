@@ -610,7 +610,7 @@ class Emu35Sampler:
                 "width": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 64}),
                 "height": ("INT", {"default": 1024, "min": 256, "max": 2048, "step": 64}),
                 "steps": ("INT", {"default": 50, "min": 1, "max": 200}),
-                "cfg_scale": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 20.0, "step": 0.1}),
+                "cfg_scale": ("FLOAT", {"default": 3.0, "min": 1.0, "max": 20.0, "step": 0.1}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
             },
             "optional": {
@@ -822,17 +822,6 @@ class Emu35Sampler:
                 logits_processor=logits_processor,
                 # streamer=streamer
             )
-            
-        # DEBUG: Print FULL output including input
-        full_output = outputs[0].tolist()
-        print(f"DEBUG: Full output length: {len(full_output)}, Input length: {input_ids.shape[1]}")
-        print(f"DEBUG: Full output first 30 tokens: {full_output[:30]}")
-        print(f"DEBUG: Full output tokens around input boundary: {full_output[input_ids.shape[1]-5:input_ids.shape[1]+10]}")
-        
-        # Check for special tokens in FULL output
-        print(f"DEBUG: BOI (151852) in full output: {BOI_TOKEN_ID in full_output}")
-        print(f"DEBUG: EOI (151853) in full output: {EOI_TOKEN_ID in full_output}")
-        print(f"DEBUG: IMG (151851) in full output: {IMG_TOKEN_ID in full_output}")
             
         # Decode only new tokens
         # outputs contains [input_ids + generated_tokens]
@@ -1095,23 +1084,19 @@ class Emu35Sampler:
                 raise e
 
         try:
-            # Use FULL output (including input) to find BOI/EOI markers
-            # The logits processor generates BOI as part of the sequence
-            full_token_list = outputs[0].tolist()
-            
             # Extract text response (before BOI token ID)
+            token_list = generated_tokens_tensor[0].tolist()
             try:
-                boi_pos = full_token_list.index(BOI_TOKEN_ID)
-                # Text is between end of input prompt and BOI
-                text_token_ids = full_token_list[input_ids.shape[1]:boi_pos]
+                boi_pos = token_list.index(BOI_TOKEN_ID)
+                text_token_ids = token_list[:boi_pos]
                 if text_token_ids:
                     text_response = tokenizer.decode(text_token_ids, skip_special_tokens=True).strip()
             except ValueError:
-                # No BOI token found - will be handled below
+                # No BOI token found
                 pass
             
-            # Decode image from FULL token list (needs BOI/EOI markers)
-            image = decode_image_from_tokens(full_token_list, vq_model)
+            # Decode image from raw token IDs
+            image = decode_image_from_tokens(token_list, vq_model)
             
             if image is None:
                  raise ValueError("Failed to decode image from tokens.")

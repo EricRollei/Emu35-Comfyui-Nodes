@@ -1,15 +1,17 @@
 # Emu3.5 ComfyUI Nodes
 
-**Experimental ComfyUI integration for BAAI's Emu3.5 multimodal models**
+**ComfyUI integration for BAAI's Emu3.5 multimodal models**
 
-⚠️ **STATUS: RESEARCH/EXPERIMENTAL** - Emu3.5-Image model is incomplete and not production-ready. See [Known Issues](#known-issues) below.
+✅ **STATUS: WORKING** - Text-to-image generation verified on December 7, 2025
+
+![Example Output](assets/Emu35Image_2025-12-07_15-06-02_000.png)
 
 ## Overview
 
 This repository provides ComfyUI custom nodes for running BAAI's Emu3.5 models for text-to-image generation and multimodal understanding. 
 
 **Models Supported:**
-- Emu3.5-Image (Text-to-Image) - ⚠️ Currently produces low-quality outputs
+- Emu3.5-Image (Text-to-Image) - ✅ Working
 - Emu3.5-Base (Foundation model)
 - Vision Tokenizer (VQ-VAE for image encoding/decoding)
 
@@ -22,7 +24,7 @@ This project is built upon and inspired by:
   - Authors: Emu3.5 Team, Beijing Academy of Artificial Intelligence
   - License: Apache 2.0
 
-- **[BAAI Emu3](https://github.com/baaivision/Emu3)** - Predecessor model (more stable for production use)
+- **[BAAI Emu3](https://github.com/baaivision/Emu3)** - Predecessor model
   - Paper: [Emu3: Next-Token Prediction is All You Need](https://arxiv.org/pdf/2409.18869)
 
 All model weights and architecture remain property of BAAI under Apache 2.0 license.
@@ -32,7 +34,7 @@ All model weights and architecture remain property of BAAI under Apache 2.0 lice
 ### Prerequisites
 - ComfyUI installed
 - Python 3.10+
-- CUDA-capable GPU with 24GB+ VRAM (FP16) or 16GB+ (NF4 quantization)
+- CUDA-capable GPU with 24GB+ VRAM (BF16) or 16GB+ (NF4 quantization)
 - 100GB+ disk space for model weights
 
 ### Method 1: Git Clone (Recommended)
@@ -60,17 +62,17 @@ pip install -r requirements.txt
 
 Place models in `ComfyUI/models/emu35/`:
 
-**Option A: NF4 Quantized (Recommended - 24GB VRAM)**
+**Option A: Full BF16 (Recommended - 48GB+ VRAM)**
 ```bash
-# NF4 quantized version - works with 24-32GB VRAM
-huggingface-cli download wikeeyang/Emu35-Image-NF4 --local-dir models/emu35/emu3.5-Image-NF4
+# Full precision - best quality
+huggingface-cli download BAAI/Emu3.5-Image --local-dir models/emu35/Emu3.5-Image
 huggingface-cli download BAAI/Emu3.5-VisionTokenizer --local-dir models/emu35/vision_tokenizer
 ```
 
-**Option B: Full FP16 (48GB+ VRAM)**
+**Option B: NF4 Quantized (24GB VRAM)**
 ```bash
-# Full precision - requires 48GB+ VRAM
-huggingface-cli download BAAI/Emu3.5-Image --local-dir models/emu35/emu3.5-Image
+# NF4 quantized version - works with 24-32GB VRAM
+huggingface-cli download wikeeyang/Emu35-Image-NF4 --local-dir models/emu35/Emu3.5-Image-NF4
 huggingface-cli download BAAI/Emu3.5-VisionTokenizer --local-dir models/emu35/vision_tokenizer
 ```
 
@@ -85,7 +87,7 @@ ComfyUI/
 │       └── Emu3_5_repo/  (official repo)
 └── models/
     └── emu35/
-        ├── emu3.5-Image-NF4/  (or emu3.5-Image/)
+        ├── Emu3.5-Image/  (or Emu3.5-Image-NF4/)
         └── vision_tokenizer/
 ```
 
@@ -97,7 +99,7 @@ ComfyUI/
 Loads the Emu3.5 model, tokenizer, and VQ model.
 
 **Inputs:**
-- `model_name`: Select model folder (e.g., "emu3.5-Image")
+- `model_name`: Select model folder (e.g., "Emu3.5-Image")
 - `vq_model_name`: Vision tokenizer folder (usually "vision_tokenizer")
 - `precision`: bf16 (default), fp16, fp32, or nf4 (quantized)
 
@@ -130,38 +132,56 @@ Generates images from text prompts.
               [Text Prompt: "a red apple on a table"]
 ```
 
-## Status Update (Dec 2024)
+## Status Update (December 2025)
 
-**Previous Issue**: We were using an incorrect prompt format that didn't match the model's training template.
+✅ **WORKING** - Text-to-image generation is now fully functional!
 
-**Fixes Applied**: 
-1. Updated to use the official chat-style template:
+### Key Fixes Applied
+
+1. **SDPA Attention Bug on Blackwell GPUs**: SDPA attention produces noise/garbage on Blackwell architecture (sm_120) with CUDA 12.8. Fixed by using `attn_implementation="eager"`.
+
+2. **Transformers 4.57+ Compatibility**: The official Emu3.5 code was written for transformers 4.48. We've patched `modeling_emu3.py` to work with transformers 4.50+:
+   - Added `GenerationMixin` inheritance for `generate()` method
+   - Fixed `DynamicCache` API changes (`get_usable_length` → `get_seq_length`)
+   - Fixed attention mask size mismatches with proper `-inf` padding
+
+3. **Attention Mask Handling**: Fixed critical bugs in mask padding:
+   - Use `-inf` (not zeros) to mask non-existent positions
+   - Keep FIRST tokens when trimming (history/prompt), not LAST
+
+4. **Prompt Format**: Using official chat-style template:
 ```
-<|extra_203|>You are a helpful assistant for t2i task. USER: {prompt} ASSISTANT: <|extra_100|>
+<|extra_203|>You are a helpful assistant. USER: {prompt} ASSISTANT:
 ```
 
-2. **transformers 4.50+ Compatibility**: Added `GenerationMixin` inheritance to fix `generate()` method issue. The Emu3.5 repo's modeling code has been patched to work with newer transformers versions (4.50+) without requiring a downgrade.
+### Tested Configuration
 
-**Recommended Setup**:
-- Use the [wikeeyang/Emu35-Image-NF4](https://huggingface.co/wikeeyang/Emu35-Image-NF4) quantized model
-- CFG scale of 5.0 (official default)
-- 24-32GB VRAM required
+| Component | Version/Setting |
+|-----------|-----------------|
+| GPU | NVIDIA RTX 6000 Pro (Blackwell) |
+| CUDA | 12.8 |
+| PyTorch | 2.7+ |
+| Transformers | 4.57.1 |
+| Attention | `eager` (not SDPA) |
+| Precision | BF16 |
 
 ## Known Issues
 
-⚠️ **Note**: The model is still in research preview status.
+1. **VRAM Requirements**: Full BF16 model needs 48GB+, NF4 quantized needs 24-32GB
 
-1. **VRAM Requirements**: Full model needs 48GB+, NF4 quant needs 24-32GB
-2. **Generation Speed**: Autoregressive generation is slow compared to diffusion models
-3. **Transformers Version**: Official docs recommend transformers==4.48.2, but our patched code works with newer versions (4.50+). If you encounter issues, the patches in `Emu3_5_repo/src/emu3p5/modeling_emu3.py` fix the cache API changes.
-4. **Roadmap Items**: BAAI's TODO shows "Advanced image decoder" and "DiDA (Discrete Diffusion Adaptation)" as future features
+2. **Generation Speed**: Autoregressive generation is slower than diffusion models (~10-15 min for 512x512)
 
-### Recommended Alternatives
+3. **Blackwell GPU + SDPA**: SDPA attention produces corrupted outputs on Blackwell GPUs. Use `eager` attention (automatically set).
 
-For production use, consider:
-- **[BAAI/Emu3-Gen](https://huggingface.co/BAAI/Emu3-Gen)** - Stable predecessor model with working T2I
-- **Stable Diffusion** / **FLUX** - More mature text-to-image solutions
-- **Wait for Emu3.5 completion** - Monitor BAAI's repo for updates
+4. **NF4 Quantization**: The `lm_head` must NOT be quantized or outputs will be garbage. Our loader verifies this.
+
+### GPU Compatibility
+
+| GPU Architecture | SDPA | Eager | Recommended |
+|-----------------|------|-------|-------------|
+| Ampere (sm_80) | ✅ | ✅ | SDPA |
+| Ada Lovelace (sm_89) | ✅ | ✅ | SDPA |
+| Blackwell (sm_120) | ❌ | ✅ | **Eager** |
 
 ## Technical Details
 
@@ -192,19 +212,25 @@ Where H, W are latent dimensions (height/16, width/16).
 ## Troubleshooting
 
 ### Issue: "Model has no 'generate' method"
-**Solution**: This warning is expected. The code automatically adds `GenerationMixin` to fix this.
+**Solution**: This is automatically fixed. The patched `modeling_emu3.py` adds `GenerationMixin` inheritance.
 
 ### Issue: "Tokenizer crashes on loading"
-**Solution**: The patched tokenizer synthesizes missing visual tokens automatically.
+**Solution**: The patched tokenizer handles missing visual tokens automatically.
 
 ### Issue: "Out of memory"
 **Solution**: 
-- Use `nf4` precision (requires ~16GB VRAM)
-- Reduce image dimensions
+- Use `nf4` precision (requires ~24GB VRAM)
+- Reduce image dimensions (512x512 instead of 1024x1024)
 - Enable `--lowvram` in ComfyUI launch args
 
-### Issue: "Images are garbage/static"
-**Status**: Known issue with Emu3.5-Image checkpoint. See [Known Issues](#known-issues).
+### Issue: "Images are noise/garbage"
+**Solution**: 
+- If on Blackwell GPU: Ensure `attn_implementation="eager"` (automatic in our loader)
+- If NF4 quantized: Verify `lm_head` is NOT quantized (check console output)
+- Verify model weights with `python verify_hashes.py` (if available)
+
+### Issue: "Attention mask size mismatch"
+**Solution**: Our patched `modeling_emu3.py` handles transformers 4.57+ cache API changes. If you still see this error, delete `__pycache__` folders and restart.
 
 ## Development
 
@@ -278,3 +304,366 @@ Special thanks to:
 ---
 
 **Disclaimer**: This is an unofficial, experimental integration. For official Emu3.5 usage, refer to [BAAI's repository](https://github.com/baaivision/Emu3.5).
+
+---
+
+## 🎯 Emu3.5 Feature To-Do List
+
+### HIGH PRIORITY - Officially Supported, High Value
+
+#### 1. Image Editing / Variation
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Parameter exists in Emu35Sampler but not implemented |
+| **Official Support** | ✅ Yes (in official repo) |
+| **Value** | ⭐⭐⭐⭐⭐ (Very useful for workflows) |
+| **Complexity** | 🔧🔧 Medium |
+
+**Description:** Feed an input image to the model for editing/variation
+
+**Implementation:**
+- Encode input image with VQ-VAE
+- Format as: `BOI -> resolution -> IMG -> visual tokens -> EOI`
+- Prepend to prompt or use specific editing template
+- Model generates modified/variation of input
+
+**Use Cases:**
+- "Make this image look like it's at sunset"
+- "Add a hat to the person in this photo"
+- Style transfer, variations, refinements
+
+---
+
+#### 2. Chain-of-Thought Prompting
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | CoT extraction implemented, but no way to REQUEST CoT |
+| **Official Support** | ✅ Yes (special tokens set) |
+| **Value** | ⭐⭐⭐⭐ (Research, debugging, better results) |
+| **Complexity** | 🔧 Easy |
+
+**Description:** Ask model to show reasoning BEFORE generating image
+
+**Implementation:**
+- Add checkbox: "Enable Chain-of-Thought"
+- Modify prompt to request reasoning: "Think step by step before generating the image. {prompt}"
+- Or wrap prompt in CoT tokens
+
+**Use Cases:**
+- Understanding why model chose certain composition
+- Better results through explicit reasoning
+- Research and analysis
+
+---
+
+### MEDIUM PRIORITY - Officially Supported, Moderate Value
+
+#### 3. Multiple Images in Single Generation
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented |
+| **Official Support** | ✅ Yes (multimodal_decode handles it) |
+| **Value** | ⭐⭐⭐⭐ (Creative workflows) |
+| **Complexity** | 🔧🔧🔧 Medium-High |
+
+**Description:** Model generates multiple images in one pass
+
+**Implementation:**
+- Change RETURN_TYPES to support image arrays
+- Parse all images from multimodal_decode
+- Return list/batch of images
+
+**Challenges:**
+- ComfyUI node output typing (might need custom output type)
+- UI complexity (how to display multiple images)
+
+**Use Cases:**
+- "Generate a before and after comparison"
+- "Show 3 variations of this concept"
+- Sequential storytelling
+
+---
+
+#### 4. Streaming Generation
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented |
+| **Official Support** | ✅ Yes (streaming_generate function) |
+| **Value** | ⭐⭐⭐ (UX improvement) |
+| **Complexity** | 🔧🔧🔧🔧 High |
+
+**Description:** Show progressive generation (text/image tokens as they're generated)
+
+**Implementation:**
+- Use official `streaming_generate()` instead of `generate()`
+- Implement callback/webhook to update UI
+- Requires async/threading support
+
+**Challenges:**
+- ComfyUI architecture doesn't support streaming well
+- Complex to implement properly
+- May need custom UI components
+
+**Use Cases:**
+- Real-time feedback during long generations
+- Early stopping if generation goes wrong
+- Better UX for slow models
+
+---
+
+#### 5. Video Generation (Emu3.5-Video)
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented at all |
+| **Official Support** | ✅ Yes (separate model: Emu3.5-Video) |
+| **Value** | ⭐⭐⭐⭐⭐ (Huge feature) |
+| **Complexity** | 🔧🔧🔧🔧🔧 Very High |
+
+**Description:** Text-to-Video and Image-to-Video generation
+
+**Implementation:**
+- Create separate loader for Video model
+- Implement temporal dimension handling
+- Video tokenization/detokenization
+- Frame generation and encoding
+
+**Requirements:**
+- Emu3.5-Video model (separate download)
+- Video codec support
+- Significantly more VRAM
+
+**Use Cases:**
+- Text-to-video: "A cat walking across a room"
+- Image-to-video: Animate a still image
+- Video editing/style transfer
+
+---
+
+### LOW PRIORITY - Quality of Life Improvements
+
+#### 6. Batch Generation
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented |
+| **Official Support** | ⚠️ Partial (model supports batch, but examples don't use it) |
+| **Value** | ⭐⭐⭐ (Efficiency) |
+| **Complexity** | 🔧🔧 Medium |
+
+**Description:** Generate multiple images in one pass (different prompts/seeds)
+
+**Implementation:**
+- Add "batch_size" parameter
+- Process multiple prompts in parallel
+- Return batched tensor
+
+**Use Cases:**
+- Generate 4 variations with different seeds
+- Compare different prompts side-by-side
+
+---
+
+#### 7. Advanced Sampling Parameters
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Using defaults |
+| **Official Support** | ✅ Yes (many parameters available) |
+| **Value** | ⭐⭐ (Power users) |
+| **Complexity** | 🔧 Easy |
+
+**Description:** Expose more generation parameters to users
+
+**Current:** `image_top_k`, `temperature` are hardcoded
+
+**Could Add:**
+- `text_top_k`, `text_top_p`, `text_temperature`
+- `image_top_p`, `image_temperature`
+- `use_differential_sampling` toggle
+- `num_beams` for beam search
+
+**Use Cases:**
+- Fine-tuning generation quality
+- Experimentation
+- Reproducibility research
+
+---
+
+#### 8. Negative Prompting (Better Implementation)
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Basic implementation in Emu35Sampler |
+| **Official Support** | ⚠️ Indirect (CFG supports it) |
+| **Value** | ⭐⭐⭐ (Quality control) |
+| **Complexity** | 🔧 Easy |
+
+**Description:** Better negative prompt handling
+
+**Current Issue:** Negative prompt uses same template as positive
+
+**Could Improve:**
+- Test if different negative templates work better
+- Add "negative weight" parameter
+- Research optimal negative prompting for Emu3.5
+
+**Use Cases:**
+- "No hands, no text, no watermarks"
+- Fine control over what NOT to generate
+
+---
+
+#### 9. LoRA / Fine-tuning Support
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented |
+| **Official Support** | ❓ Unknown (likely possible, not documented) |
+| **Value** | ⭐⭐⭐⭐⭐ (Customization) |
+| **Complexity** | 🔧🔧🔧🔧 High |
+
+**Description:** Load and apply LoRA weights for custom styles
+
+**Implementation:**
+- LoRA weight loading
+- Merging with base model
+- Multi-LoRA support
+
+**Use Cases:**
+- Custom art styles
+- Specific character/object training
+- Domain adaptation
+
+---
+
+#### 10. Model/Tokenizer Caching
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Loads from scratch each time |
+| **Official Support** | N/A (implementation detail) |
+| **Value** | ⭐⭐⭐ (Performance) |
+| **Complexity** | 🔧 Easy |
+
+**Description:** Cache loaded models between runs
+
+**Implementation:**
+- Global cache dict
+- Check cache before loading
+- LRU eviction for memory management
+
+**Use Cases:**
+- Faster workflow iterations
+- Multiple workflows using same model
+
+---
+
+#### 11. Image Resolution Validation
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | No validation |
+| **Official Support** | N/A (safety feature) |
+| **Value** | ⭐⭐ (UX) |
+| **Complexity** | 🔧 Easy |
+
+**Description:** Warn/prevent invalid resolutions
+
+**Implementation:**
+- Check width/height are multiples of 16
+- Warn if too large (VRAM limits)
+- Auto-adjust to nearest valid size
+
+**Use Cases:**
+- Prevent user errors
+- Better error messages
+
+---
+
+#### 12. Prompt Templates Library
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Templates are hardcoded |
+| **Official Support** | N/A (UX feature) |
+| **Value** | ⭐⭐ (Convenience) |
+| **Complexity** | 🔧 Easy |
+
+**Description:** Preset templates for different use cases
+
+**Templates:**
+- Photography styles
+- Art styles
+- Specific domains (architecture, product, portrait)
+
+**Use Cases:**
+- Quick starts for new users
+- Consistent results
+
+---
+
+### EXPERIMENTAL - Not Officially Documented
+
+#### 13. Inpainting/Outpainting
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented |
+| **Official Support** | ❓ Unknown |
+| **Value** | ⭐⭐⭐⭐⭐ (Very powerful) |
+| **Complexity** | 🔧🔧🔧🔧🔧 Very High |
+
+**Description:** Edit specific regions or extend images
+
+**Would Require:** Research into whether Emu3.5 supports this
+
+---
+
+#### 14. ControlNet-style Conditioning
+
+| Attribute | Status |
+|-----------|--------|
+| **Status** | Not implemented |
+| **Official Support** | ❓ Unknown |
+| **Value** | ⭐⭐⭐⭐⭐ (Precise control) |
+| **Complexity** | 🔧🔧🔧🔧🔧 Very High |
+
+**Description:** Condition generation on edge maps, depth, etc.
+
+**Would Require:** Research and possibly model fine-tuning
+
+---
+
+### 📋 Recommended Implementation Order
+
+#### Phase 1: Quick Wins (1-2 weeks)
+- [ ] Chain-of-Thought prompting (add checkbox)
+- [ ] Advanced sampling parameters (expose existing params)
+- [ ] Model caching (performance boost)
+
+#### Phase 2: High Value (2-4 weeks)
+- [ ] Image editing/variation (use input_image parameter)
+- [ ] Negative prompt improvements
+- [ ] Batch generation
+
+#### Phase 3: Major Features (1-2 months)
+- [ ] Multiple images per generation
+- [ ] Video generation (Emu3.5-Video model)
+
+#### Phase 4: Advanced (Research required)
+- [ ] Streaming generation
+- [ ] LoRA support
+- [ ] Inpainting/outpainting (if possible)
+
+---
+
+### 🎯 Top 3 Recommendations
+
+1. **Image Editing** - High value, moderate effort, officially supported
+2. **CoT Prompting** - Easy win, improves quality, unique feature
+3. **Video Generation** - Huge feature, but requires separate model

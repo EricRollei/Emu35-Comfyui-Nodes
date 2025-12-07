@@ -75,22 +75,18 @@ class Emu3Tokenizer(PreTrainedTokenizer):
         # 'Invalid token for decoding'. We approximate the official list here when the file is absent.
         if not vision_tokens:
             print("DEBUG: vision_tokens is empty. Synthesizing fallback special tokens.")
-            # Based on logits_processor.py constants:
-            # BOS = 151849 (<|extra_203|>)
-            # EOS = 151850 (<|extra_204|>)
-            # IMG = 151851 (<|image|>)
-            # BOI = 151852 (<|begin_of_image|>)
-            # EOI = 151853 (<|end_of_image|>)
-            # BOV = 151854 (<|video|>)
+            # Based on official emu3_vision_tokens.txt:
+            # IMG = 151851 (<|image token|>)
+            # BOI = 151852 (<|image start|>)
+            # EOI = 151853 (<|image end|>)
+            # First visual token starts at 151854
             #
-            # The previous list included <|begin_of_video|> and <|end_of_video|> which shifted visual tokens.
-            # We must align exactly so that the first visual token starts at 151855.
+            # IMPORTANT: These must match emu3_vision_tokens.txt exactly!
             
             base_vision_tokens = [
-                "<|image|>",          # 151851
-                "<|begin_of_image|>", # 151852
-                "<|end_of_image|>",   # 151853
-                "<|video|>",          # 151854
+                "<|image token|>",    # 151851 - Official name
+                "<|image start|>",    # 151852 - Official name
+                "<|image end|>",      # 151853 - Official name
             ]
             generated_tokens = [
                 f"<|visual token {token_id:0>6d}|>" for token_id in range(DEFAULT_VISUAL_TOKEN_COUNT)

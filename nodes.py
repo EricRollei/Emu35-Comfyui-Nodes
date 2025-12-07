@@ -37,230 +37,55 @@ if os.path.exists(emu_repo_path):
     try:
         from src.emu3p5 import Emu3ForCausalLM, Emu3Config
         from src.vision_tokenizer import build_vision_tokenizer
-        from src.utils.generation_utils import build_logits_processor
-        # We use our local patched tokenizer instead of the repo one
-        try:
-            # Ensure current dir is in sys.path
-            if current_dir not in sys.path:
-                sys.path.append(current_dir)
-            from patched_tokenization_emu3 import Emu3Tokenizer
-        except ImportError as e:
-            Emu3Tokenizer = None
-            print(f"Could not import patched Emu3Tokenizer: {e}. Will rely on AutoTokenizer.")
-            
+        from src.utils.generation_utils import build_logits_processor, decode_image as official_decode_image, multimodal_decode
+        # Note: Tokenizer is loaded via AutoTokenizer.from_pretrained with trust_remote_code=True
+        # This loads tokenization_emu3.py from the model directory (we copy our patched version there)
     except ImportError as e:
         print(f"Error importing Emu3.5 modules: {e}")
         print("Please ensure the Emu3.5 repository is cloned into 'Emu3_5_repo' inside this node's directory.")
 
-# Local implementation of decode_image to avoid dependency on repo updates
+# Fallback local implementation of decode_image only if official import fails
 import re
 from typing import List
 from PIL import Image
 import numpy as np
 
 # Constants for token IDs
-BOI_TOKEN_ID = 151852  # <|begin_of_image|>
-EOI_TOKEN_ID = 151853  # <|end_of_image|>
+BOI_TOKEN_ID = 151852  # <|image start|>
+EOI_TOKEN_ID = 151853  # <|image end|>
 IMG_TOKEN_ID = 151851  # <|image|>
-EOL_TOKEN_ID = 151846  # <|extra_200|> (end of line)
-VISUAL_TOKEN_START = 151855  # First visual token ID
-
-def decode_image_from_tokens(token_ids, vision_tokenizer):
-    """Decode image directly from token IDs (not string)."""
-    # Find BOI and EOI positions
-    try:
-        boi_idx = token_ids.index(BOI_TOKEN_ID)
-        eoi_idx = token_ids.index(EOI_TOKEN_ID)
-        print(f"DEBUG: Found BOI at index {boi_idx}, EOI at index {eoi_idx}")
-    except ValueError as e:
-        print(f"DEBUG: Could not find BOI or EOI tokens in sequence")
-        print(f"DEBUG: Looking for BOI={BOI_TOKEN_ID}, EOI={EOI_TOKEN_ID}")
-        print(f"DEBUG: First 50 token IDs: {token_ids[:50]}")
-        print(f"DEBUG: Last 50 token IDs: {token_ids[-50:]}")
-        # Check if BOI exists
-        if BOI_TOKEN_ID in token_ids:
-            print(f"DEBUG: BOI found at index {token_ids.index(BOI_TOKEN_ID)}")
-        else:
-            print("DEBUG: NO BOI token in sequence!")
-        if EOI_TOKEN_ID in token_ids:
-            print(f"DEBUG: EOI found at index {token_ids.index(EOI_TOKEN_ID)}")
-        else:
-            print("DEBUG: NO EOI token in sequence!")
-        return None
-    
-    # Extract tokens between BOI and EOI
-    image_tokens = token_ids[boi_idx + 1:eoi_idx]
-    
-    # Split by EOL to get rows
-    rows = []
-    current_row = []
-    
-    for tok in image_tokens:
-        if tok == EOL_TOKEN_ID:
-            if current_row:
-                rows.append(current_row)
-                current_row = []
-        elif tok >= VISUAL_TOKEN_START:
-            # Convert token ID to visual token index
-            visual_idx = tok - VISUAL_TOKEN_START
-            current_row.append(visual_idx)
-        # Ignore IMG token and resolution numbers
-    
-    if current_row:  # Add last row if no trailing EOL
-        rows.append(current_row)
-    
-    if not rows:
-        print("DEBUG: No visual tokens found")
-        return None
-    
-    print(f"DEBUG: First 10 visual token indices: {rows[0][:10] if rows[0] else []}")
-    
-    # Determine target width
-    from collections import Counter
-    widths = [len(r) for r in rows]
-    target_width = Counter(widths).most_common(1)[0][0]
-    
-    # Pad/truncate rows to same width
-    final_image = []
-    for row in rows:
-        if len(row) == target_width:
-            final_image.append(row)
-        elif len(row) > target_width:
-            final_image.append(row[:target_width])
-        else:
-            pad_token = row[-1] if row else 0
-            final_image.append(row + [pad_token] * (target_width - len(row)))
-    
-    # Convert to tensor
-    image = torch.tensor(
-        final_image, dtype=torch.long, device=next(iter(vision_tokenizer.parameters())).device
-    )
-    
-    min_tok = image.min().item()
-    max_tok = image.max().item()
-    print(f"DEBUG: Visual Token Range: [{min_tok}, {max_tok}]")
-    
-    h, w = image.shape
-    
-    # Get embedding dim
-    if hasattr(vision_tokenizer, "quantize") and hasattr(vision_tokenizer.quantize, "e_dim"):
-        embed_dim = vision_tokenizer.quantize.e_dim
-        n_embed = getattr(vision_tokenizer.quantize, "n_embed", 262144)
-        print(f"DEBUG: VQ-VAE Config - embed_dim: {embed_dim}, n_embed: {n_embed}")
-        
-        if max_tok >= n_embed:
-            print(f"WARNING: Max token ID ({max_tok}) exceeds VQ-VAE codebook size ({n_embed})!")
-    else:
-        embed_dim = 256
-        print(f"Warning: Could not determine embed_dim, using default {embed_dim}")
-    
-    # Decode to image
-    image = vision_tokenizer.decode_code(image[None], shape=(1, h, w, embed_dim)).float()
-    image = image[0].permute(1, 2, 0)
-    image = Image.fromarray(
-        ((image + 1.0) * 127.5).clamp(0, 255).detach().cpu().numpy().astype(np.uint8)
-    )
-    return image
 
 def decode_image(image_string, tokenizer, vision_tokenizer):
+    """
+    Official Emu3.5 decode_image - exact match from generation_utils.py
+    CRITICAL: No width padding, hardcoded embed_dim=256
+    """
+    import re
+    from typing import List
+    
     image: List[List[int]] = []
-    # Fix for 'Emu3Tokenizer' object has no attribute 'eol_token'
-    # The tokenizer might not have eol_token set as an attribute, but it should be in special_tokens
-    eol_token = getattr(tokenizer, "eol_token", "<|eol|>")
-    
-    # Extract only the image region between BOI and EOI
-    boi_token = "<|begin_of_image|>"
-    eoi_token = "<|end_of_image|>"
-    
-    # Find the image content
-    boi_idx = image_string.find(boi_token)
-    eoi_idx = image_string.find(eoi_token)
-    
-    if boi_idx == -1 or eoi_idx == -1 or boi_idx >= eoi_idx:
-        print(f"DEBUG: Could not find image markers in decoded string. BOI: {boi_idx}, EOI: {eoi_idx}")
-        return None
-    
-    # Extract substring between BOI and EOI (excluding the markers themselves)
-    image_content = image_string[boi_idx + len(boi_token):eoi_idx]
-    
-    # Split by EOL tokens
-    image_rows = re.split(re.escape(eol_token), image_content)
-    
-    # First pass: collect all valid rows
-    raw_rows = []
-    debug_first_tokens = []
+    image_rows = re.split(re.escape(tokenizer.eol_token), image_string)
     for r in image_rows:
         token_ids = re.findall(r"<\|visual token (\d+)\|>", r)
         if len(token_ids) > 0:
             row_token = [int(m) for m in token_ids]
-            raw_rows.append(row_token)
-            if len(debug_first_tokens) < 10:
-                debug_first_tokens.extend(row_token[:10])
-    
-    if debug_first_tokens:
-        print(f"DEBUG: First 10 decoded visual token indices: {debug_first_tokens[:10]}")
-            
-    if not raw_rows:
-        return None
-
-    # Determine target width (use the most common width or the max width)
-    # Using max width is safer to avoid cutting off data, but padding is needed
-    widths = [len(r) for r in raw_rows]
-    if not widths:
-        return None
-        
-    # Use the most frequent width as the target, assuming outliers are errors
-    from collections import Counter
-    target_width = Counter(widths).most_common(1)[0][0]
-    
-    # Second pass: pad or truncate
-    final_image = []
-    for row in raw_rows:
-        if len(row) == target_width:
-            final_image.append(row)
-        elif len(row) > target_width:
-            final_image.append(row[:target_width])
-        else:
-            # Pad with the last token of the row or 0
-            # Using the last token is visually safer than black (0)
-            pad_token = row[-1] if row else 0
-            final_image.append(row + [pad_token] * (target_width - len(row)))
-            
+            image.append(row_token)
     try:
         image = torch.tensor(
-            final_image, dtype=torch.long, device=next(iter(vision_tokenizer.parameters())).device
+            image, dtype=torch.long, device=next(iter(vision_tokenizer.parameters())).device
         )
-        
-        # DEBUG: Check token range
-        min_tok = image.min().item()
-        max_tok = image.max().item()
-        print(f"DEBUG: Visual Token Range: [{min_tok}, {max_tok}]")
-        
         h, w = image.shape
-        
-        # Get embedding dim dynamically from the quantizer
-        # The quantizer is usually at vision_tokenizer.quantize
-        if hasattr(vision_tokenizer, "quantize") and hasattr(vision_tokenizer.quantize, "e_dim"):
-            embed_dim = vision_tokenizer.quantize.e_dim
-            n_embed = getattr(vision_tokenizer.quantize, "n_embed", "Unknown")
-            print(f"DEBUG: VQ-VAE Config - embed_dim: {embed_dim}, n_embed: {n_embed}")
-            
-            if isinstance(n_embed, int) and max_tok >= n_embed:
-                print(f"WARNING: Max token ID ({max_tok}) exceeds VQ-VAE codebook size ({n_embed})!")
-                # Optional: Clamp or modulo?
-                # image = image % n_embed
-        else:
-            embed_dim = 256 # Fallback if not found
-            print(f"Warning: Could not determine embed_dim from vision_tokenizer, using default {embed_dim}")
-
-        image = vision_tokenizer.decode_code(image[None], shape=(1, h, w, embed_dim)).float()
+        # CRITICAL: Official code ALWAYS uses 256 for embed_dim
+        image = vision_tokenizer.decode_code(image[None], shape=(1, h, w, 256)).float()
         image = image[0].permute(1, 2, 0)
         image = Image.fromarray(
             ((image + 1.0) * 127.5).clamp(0, 255).detach().cpu().numpy().astype(np.uint8)
         )
         return image
     except Exception as ex:
-        print(f"decode image failed {ex}")
+        print(f"decode_image failed: {ex}")
+        import traceback
+        traceback.print_exc()
         return None
 # End of local decode_image
 
@@ -345,13 +170,10 @@ class Emu35Loader:
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
-        # Check for Flash Attention
-        try:
-            import flash_attn
-            attn_impl = "flash_attention_2"
-        except ImportError:
-            print("Flash Attention not found. Using 'sdpa' (PyTorch Scaled Dot Product Attention).")
-            attn_impl = "sdpa"
+        # CRITICAL: Use eager attention - sdpa produces noise on Blackwell GPUs (sm_120) + CUDA 12.8
+        # This matches the working emu35test/Emu3.5/src/utils/model_utils.py configuration
+        attn_impl = "eager"
+        print("Using 'eager' attention implementation (sdpa causes corruption on Blackwell GPUs)")
 
         # Load Model
         if precision == "nf4":
@@ -370,29 +192,35 @@ class Emu35Loader:
                 trust_remote_code=True,
                 attn_implementation=attn_impl
             )
+            
+            # Verify lm_head is NOT quantized
+            if hasattr(model, "lm_head"):
+                lm_head_type = str(type(model.lm_head))
+                lm_head_dtype = model.lm_head.weight.dtype
+                
+                print(f"\nNF4 Verification:")
+                print(f"  lm_head type: {lm_head_type}")
+                print(f"  lm_head dtype: {lm_head_dtype}")
+                
+                if "Linear4bit" in lm_head_type:
+                    print("="*80)
+                    print("⚠️  CRITICAL ERROR: lm_head was quantized!")
+                    print("⚠️  This will produce GARBAGE outputs (visual noise)")
+                    print("⚠️  Your bitsandbytes/transformers version doesn't support skip_modules")
+                    print("⚠️  SOLUTION: Use bf16, fp16, or fp32 precision instead")
+                    print("="*80)
+                    raise ValueError("lm_head quantization detected - cannot proceed with NF4")
+                else:
+                    print(f"  ✓ lm_head correctly preserved (not quantized)")
         else:
             model = Emu3ForCausalLM.from_pretrained(
                 model_path,
                 config=config,
                 torch_dtype=dtype,
-                device_map="auto",
+                device_map="cuda:0",  # Force entire model to GPU 0 (no CPU offloading)
                 trust_remote_code=True,
                 attn_implementation=attn_impl
             )
-        
-        # DEBUG: Check lm_head dtype
-        if hasattr(model, "lm_head"):
-            print(f"DEBUG: lm_head dtype: {model.lm_head.weight.dtype}")
-            if precision == "nf4" and model.lm_head.weight.dtype != torch.float32 and model.lm_head.weight.dtype != torch.bfloat16:
-                print("WARNING: lm_head is not float32/bfloat16! Forcing float32...")
-                # If it's quantized (Linear4bit), we can't just .float() it easily without dequantizing.
-                # But if skip_modules worked, it should be a standard Linear layer.
-                print(f"lm_head type: {type(model.lm_head)}")
-                
-                # If it is Linear4bit, then skip_modules FAILED.
-                if "Linear4bit" in str(type(model.lm_head)):
-                    print("CRITICAL: llm_int8_skip_modules failed! lm_head is still quantized.")
-                    print("This is likely the cause of the static noise.")
         
         model.eval()
         
@@ -405,20 +233,20 @@ class Emu35Loader:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-        # Try to compile the model for faster inference
-        # Only compile the forward pass, not the whole generate loop
-        # We check for Triton availability first
-        # DISABLED: torch.compile breaks GenerationMixin attributes (_is_stateful)
+        # DISABLED: torch.compile + CUDA graphs incompatible with cudaMallocAsync on CUDA 12.8 + Blackwell
+        # Error: "cudaMallocAsync does not yet support checkPoolLiveAllocations"
+        # TODO: Re-enable when PyTorch/CUDA fixes CUDA graph compatibility
         # try:
         #     import triton
         #     print("Triton detected. Attempting to compile model with torch.compile...")
-        #     # Use 'max-autotune' for best performance if it works, or 'reduce-overhead' for latency
-        #     # 'reduce-overhead' is often better for autoregressive generation
-        #     model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+        #     model = torch.compile(model, mode="max-autotune", fullgraph=False)
+        #     print("✓ Model compiled successfully with torch.compile")
         # except ImportError:
         #     print("Triton not found. Skipping torch.compile.")
         # except Exception as e:
         #     print(f"Warning: torch.compile failed: {e}")
+        #     print("Model will still work, just not compiled")
+        print("torch.compile disabled (incompatible with CUDA 12.8 + Blackwell)")
 
         # Load Tokenizer
         print(f"Loading tokenizer from {model_path}...")
@@ -440,50 +268,81 @@ class Emu35Loader:
         except Exception as e:
             print(f"Warning: Could not copy tokenization_emu3.py: {e}")
 
+        # Load tokenizer EXACTLY like the working emu35test/Emu3.5/src/utils/model_utils.py does:
+        # Using AutoTokenizer.from_pretrained with special_tokens_file passed explicitly
         try:
-            # Prefer using the imported class if available to avoid "file not found" errors for remote code
-            # Use a local variable to avoid UnboundLocalError
-            LocalEmu3Tokenizer = globals().get('Emu3Tokenizer')
-
-            if LocalEmu3Tokenizer is None:
-                try:
-                    if current_dir not in sys.path:
-                        sys.path.append(current_dir)
-                    from patched_tokenization_emu3 import Emu3Tokenizer as ImportedTokenizer
-                    LocalEmu3Tokenizer = ImportedTokenizer
-                except ImportError as e:
-                    print(f"Failed to re-import Emu3Tokenizer: {e}")
-
-            if LocalEmu3Tokenizer is not None:
-                # We construct it manually to avoid from_pretrained looking for the python file if it failed to copy
-                vocab_file = os.path.join(model_path, "emu3.tiktoken")
-                if os.path.exists(vocab_file):
-                    print("Initializing Emu3Tokenizer directly...")
-                    tokenizer = LocalEmu3Tokenizer(vocab_file=vocab_file)
-                    # Load special tokens if possible, or rely on defaults
-                    # We can try to load config to get special tokens
-                else:
-                    print(f"Warning: vocab_file not found at {vocab_file}")
-                    # Fallback to from_pretrained
-                    tokenizer = LocalEmu3Tokenizer.from_pretrained(
-                        model_path,
-                        padding_side="left"
-                    )
-            else:
-                print("Emu3Tokenizer not in globals or is None. Using AutoTokenizer.")
-                tokenizer = AutoTokenizer.from_pretrained(
-                    model_path,
-                    trust_remote_code=True,
-                    padding_side="left"
-                )
+            special_tokens_file = os.path.join(model_path, "emu3_vision_tokens.txt")
+            print(f"Loading tokenizer with AutoTokenizer.from_pretrained (matching official model_utils.py)...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                special_tokens_file=special_tokens_file,  # Official code passes this explicitly!
+                trust_remote_code=True,
+                padding_side="left"
+            )
+            print(f"✓ Tokenizer loaded successfully: {type(tokenizer).__name__}")
         except Exception as e:
-            print(f"Error loading tokenizer with preferred method: {e}")
-            print("Falling back to AutoTokenizer...")
+            print(f"Error loading tokenizer: {e}")
+            print("Trying without special_tokens_file parameter...")
             tokenizer = AutoTokenizer.from_pretrained(
                 model_path,
                 trust_remote_code=True,
                 padding_side="left"
             )
+        
+        # === CRITICAL: Set tokenizer special token attributes ===
+        # The official model_utils.py sets these explicitly - used by multimodal_decode and other functions!
+        # These token STRINGS must match what's in emu3_vision_tokens.txt
+        tokenizer.bos_token = "<|extra_203|>"
+        tokenizer.eos_token = "<|extra_204|>"
+        tokenizer.pad_token = "<|endoftext|>"
+        tokenizer.eol_token = "<|extra_200|>"
+        tokenizer.eof_token = "<|extra_201|>"
+        tokenizer.tms_token = "<|extra_202|>"
+        tokenizer.img_token = "<|image token|>"    # Official: <|image token|>
+        tokenizer.boi_token = "<|image start|>"    # Official: <|image start|>
+        tokenizer.eoi_token = "<|image end|>"      # Official: <|image end|>
+        tokenizer.bss_token = "<|extra_100|>"
+        tokenizer.ess_token = "<|extra_101|>"
+        tokenizer.bog_token = "<|extra_60|>"
+        tokenizer.eog_token = "<|extra_61|>"
+        tokenizer.boc_token = "<|extra_50|>"
+        tokenizer.eoc_token = "<|extra_51|>"
+        
+        # ============== TOKENIZER VERIFICATION ==============
+        print("\n" + "="*80)
+        print("TOKENIZER VERIFICATION:")
+
+        special_tokens_to_check = {
+            "boi": tokenizer.boi_token,
+            "eoi": tokenizer.eoi_token,
+            "img": tokenizer.img_token,
+            "eol": tokenizer.eol_token,
+        }
+
+        for name, token_str in special_tokens_to_check.items():
+            token_id = tokenizer.convert_tokens_to_ids(token_str)
+            print(f"  {name}: '{token_str}' -> ID {token_id}")
+
+        # CRITICAL: Test visual token mapping
+        test_visual_token = "<|visual token 000000|>"
+        visual_id_0 = tokenizer.convert_tokens_to_ids(test_visual_token)
+        print(f"  visual_0: '{test_visual_token}' -> ID {visual_id_0}")
+
+        if visual_id_0 != 151854:
+            print(f"  ⚠️  WARNING: Visual token 0 has WRONG ID!")
+            print(f"  ⚠️  Expected 151854, got {visual_id_0}")
+            print(f"  ⚠️  This will cause corrupted images!")
+        else:
+            print(f"  ✓ Visual token mapping is correct")
+
+        # Test decoding
+        test_ids = [151854, 151855, 151856]
+        decoded_visual = tokenizer.decode(torch.tensor(test_ids), skip_special_tokens=False)
+        print(f"  Decode test: {test_ids}")
+        print(f"    -> {decoded_visual[:100]}...")
+
+        print("="*80 + "\n")
+        # ============== END VERIFICATION ==============
         
         # Load VQ-VAE
         # If vq_path points to a file (like model.ckpt), use its parent directory
@@ -494,7 +353,8 @@ class Emu35Loader:
         # build_vision_tokenizer expects the directory containing model.ckpt and config.yaml
         vq_model = build_vision_tokenizer("ibq", vq_path, device=device)
         vq_model.eval()
-        vq_model.to(dtype) # Match dtype if possible, or keep as is
+        # Keep VQ model in float32 - converting to bfloat16 causes decode artifacts!
+        # vq_model.to(dtype)  # REMOVED - VQ model must stay float32
 
         return (model, tokenizer, vq_model)
 
@@ -618,8 +478,8 @@ class Emu35Sampler:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING",)
-    RETURN_NAMES = ("image", "text_response",)
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING",)
+    RETURN_NAMES = ("image", "text", "reasoning",)
     FUNCTION = "generate"
     CATEGORY = "Emu3.5"
 
@@ -818,15 +678,15 @@ class Emu35Sampler:
         
         print("Using standard model.generate() for correctness... (Latent Size: {}x{})".format(latent_height, latent_width))
         
-        # Streamer
-        # streamer = ThrottledStreamer(needed_tokens)
+        # Streamer for progress bar
+        streamer = ThrottledStreamer(needed_tokens)
         
         with torch.no_grad():
             outputs = model.generate(
                 input_ids,
                 generation_config=generation_config,
                 logits_processor=logits_processor,
-                # streamer=streamer
+                streamer=streamer
             )
             
         # DEBUG: Print FULL output including input
@@ -1056,7 +916,7 @@ class Emu35Sampler:
             tokenizer.eol_token = "<|extra_200|>"
             print(f"DEBUG: Set tokenizer.eol_token to {tokenizer.eol_token}")
         
-        # Extract text response before image (everything before <|begin_of_image|>)
+        # Extract text response before image (everything before <|image start|>)
         text_response = ""
             
         # decode_image expects a string, but we have tokens.
@@ -1100,25 +960,30 @@ class Emu35Sampler:
             if decoded_text is None:
                 raise e
 
+        # NEW CODE - use official decoding path
         try:
-            # Use FULL output (including input) to find BOI/EOI markers
-            # The logits processor generates BOI as part of the sequence
-            full_token_list = outputs[0].tolist()
+            # Decode FULL output to string (including input)
+            output_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
             
-            # Extract text response (before BOI token ID)
-            try:
-                boi_pos = full_token_list.index(BOI_TOKEN_ID)
-                # Text is between end of input prompt and BOI
-                text_token_ids = full_token_list[input_ids.shape[1]:boi_pos]
-                if text_token_ids:
-                    text_response = tokenizer.decode(text_token_ids, skip_special_tokens=True).strip()
-            except ValueError:
-                # No BOI token found - will be handled below
-                pass
+            print(f"Decoded output length: {len(output_text)} chars")
             
-            # Decode image from FULL token list (needs BOI/EOI markers)
-            image = decode_image_from_tokens(full_token_list, vq_model)
+            # Use official multimodal_decode (handles multiple images/text)
+            mm_output = multimodal_decode(output_text, tokenizer, vq_model)
             
+            # Extract image, text, and reasoning (CoT)
+            image = None
+            text_response = ""
+            reasoning = ""
+            for item_type, item_data in mm_output:
+                if item_type == "image" and item_data is not None:
+                    image = item_data
+                elif item_type == "text":
+                    text_response += item_data
+                elif item_type == "global_cot":
+                    reasoning += f"[Global] {item_data}\n"
+                elif item_type == "image_cot":
+                    reasoning += f"[Image] {item_data}\n"
+                 
             if image is None:
                  raise ValueError("Failed to decode image from tokens.")
                  
@@ -1131,17 +996,20 @@ class Emu35Sampler:
             if isinstance(image, Image.Image):
                 image_np = np.array(image).astype(np.float32) / 255.0
                 image_tensor = torch.from_numpy(image_np)[None,] # Add batch dim
-                return (image_tensor, text_response)
+                return (image_tensor, text_response, reasoning)
             else:
                  # If it's not a PIL image, maybe it's already a tensor or something else?
                  # But decode_image in repo returns PIL Image.
                  print(f"Warning: decode_image returned {type(image)}")
-                 return (torch.zeros((1, 1024, 1024, 3)),)
+                 empty_img = torch.zeros((1, height, width, 3))
+                 return (empty_img, "", "")
             
         except Exception as e:
             print(f"Error decoding image: {e}")
-            # Return a blank image or raise
-            raise e
+            import traceback
+            traceback.print_exc()
+            empty_img = torch.zeros(1, height, width, 3)
+            return (empty_img, "", "")
 
 class Emu35ClearCache:
     @classmethod
@@ -1197,11 +1065,329 @@ class ThrottledStreamer(ComfyStreamer):
             self.pbar.update(64)
         return value
 
+
+class Emu35OfficialT2I:
+    """
+    Text-to-Image node using EXACT official Emu3.5 code structure.
+    Matches example_config_t2i.py exactly.
+    """
+    
+    # Official aspect ratios from example_config_t2i.py
+    ASPECT_RATIOS = {
+        "4:3": (55, 73),    # 880x1168
+        "21:9": (41, 97),   # 656x1552
+        "16:9": (47, 85),   # 752x1360
+        "3:2": (52, 78),    # 832x1248
+        "1:1": (64, 64),    # 1024x1024
+        "3:4": (73, 55),    # 1168x880
+        "9:16": (85, 47),   # 1360x752
+        "2:3": (78, 52),    # 1248x832
+        "default": (55, 73), # 880x1168 (same as 4:3)
+    }
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("EMU_MODEL",),
+                "tokenizer": ("EMU_TOKENIZER",),
+                "vq_model": ("EMU_VQ",),
+                "prompt": ("STRING", {"multiline": True, "default": "A cute cat sitting on a windowsill"}),
+                "aspect_ratio": (["default", "1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9"],),
+                "cfg_scale": ("FLOAT", {"default": 5.0, "min": 1.0, "max": 20.0, "step": 0.5}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING",)
+    RETURN_NAMES = ("image", "text", "reasoning",)
+    FUNCTION = "generate"
+    CATEGORY = "Emu3.5"
+
+    def generate(self, model, tokenizer, vq_model, prompt, aspect_ratio, cfg_scale, seed):
+        import gc
+        
+        device = "cuda"
+        torch.manual_seed(seed)
+        
+        # Special token IDs (from official config)
+        BOS = 151849  # <|extra_203|>
+        EOS = 151850  # <|extra_204|>
+        PAD = 151643  # <|endoftext|>
+        BOI = 151852
+        EOI = 151853
+        IMG = 151851
+        
+        # Get target size from aspect ratio (EXACTLY like official config)
+        target_height, target_width = self.ASPECT_RATIOS.get(aspect_ratio, (55, 73))
+        
+        # Match working my_test_config.py: max_new_tokens=5120
+        max_new_tokens = 5120
+        
+        print(f"[Emu35OfficialT2I] Aspect: {aspect_ratio} -> {target_height}x{target_width} latents ({target_height*16}x{target_width*16} px)")
+        
+        # === Build config object matching my_test_config.py EXACTLY ===
+        class OfficialConfig:
+            def __init__(self, cfg_scale, target_h, target_w):
+                # From my_test_config.py
+                self.classifier_free_guidance = cfg_scale
+                self.unconditional_type = "no_text"
+                self.image_cfg_scale = 1.0
+                
+                # Target size from aspect ratio
+                self.target_height = target_h
+                self.target_width = target_w
+                
+                # Sampling params - matching working my_test_config.py exactly
+                self.sampling_params = dict(
+                    use_cache=True,
+                    # text token sampling config
+                    text_top_k=1024,
+                    text_top_p=0.9,
+                    text_temperature=1.0,
+                    # image token sampling config - matching my_test_config.py
+                    image_top_k=5120,
+                    image_top_p=1.0,
+                    image_temperature=1.0,
+                    # general config
+                    top_k=131072,
+                    top_p=1.0,
+                    temperature=1.0,
+                    num_beams_per_group=1,
+                    num_beam_groups=1,
+                    diversity_penalty=0.0,
+                    max_new_tokens=5120,  # matching my_test_config.py
+                    guidance_scale=1.0,
+                    # enable differential sampling
+                    use_differential_sampling=True,
+                    do_sample=True,
+                    num_beams=1,
+                )
+        
+        cfg = OfficialConfig(cfg_scale, target_height, target_width)
+        
+        # === Build prompts matching official template ===
+        # Official t2i template (no image input)
+        template = "<|extra_203|>You are a helpful assistant for t2i task. USER: {question} ASSISTANT: <|extra_100|>"
+        unc_prompt = "<|extra_203|>You are a helpful assistant. USER:  ASSISTANT: <|extra_100|>"
+        
+        full_prompt = template.format(question=prompt)
+        
+        print(f"[Emu35OfficialT2I] Prompt: {full_prompt[:100]}...")
+        print(f"[Emu35OfficialT2I] CFG: {cfg_scale}, max_new_tokens: {max_new_tokens}")
+        
+        # === Encode prompts ===
+        input_ids = tokenizer.encode(full_prompt, return_tensors="pt", add_special_tokens=False).to(device)
+        
+        # Add BOS if not present (official does this)
+        if input_ids[0, 0] != BOS:
+            bos_tensor = torch.tensor([[BOS]], device=device, dtype=input_ids.dtype)
+            input_ids = torch.cat([bos_tensor, input_ids], dim=1)
+        
+        unconditional_ids = tokenizer.encode(unc_prompt, return_tensors="pt", add_special_tokens=False).to(device)
+        
+        print(f"[Emu35OfficialT2I] Input shape: {input_ids.shape}, Unconditional shape: {unconditional_ids.shape}")
+        
+        # === Build logits processor (official function) ===
+        print("[Emu35OfficialT2I] Building logits processor...")
+        print(f"[Emu35OfficialT2I] cfg.target_height={cfg.target_height}, cfg.target_width={cfg.target_width}")
+        print(f"[Emu35OfficialT2I] cfg.sampling_params max_new_tokens={cfg.sampling_params['max_new_tokens']}")
+        
+        lp = build_logits_processor(
+            cfg=cfg,
+            unconditional_ids=unconditional_ids,
+            model=model,
+            tokenizer=tokenizer,
+            full_unconditional_ids=None,
+            force_same_image_size=True,
+        )
+        
+        # Wrap to count calls
+        original_call = lp.__call__
+        call_count = [0]
+        def counting_call(input_ids, scores):
+            call_count[0] += 1
+            if call_count[0] <= 5:
+                print(f"[DEBUG] LogitsProcessor called #{call_count[0]}, last token: {input_ids[0, -1].item()}")
+            return original_call(input_ids, scores)
+        lp.__call__ = counting_call
+        
+        logits_processor = LogitsProcessorList()
+        logits_processor.append(lp)
+        
+        # === Build stopping criteria to stop after first image ===
+        from transformers import StoppingCriteria, StoppingCriteriaList
+        
+        class StopAfterFirstImage(StoppingCriteria):
+            """Stop generation after we see EOI (end of image) token."""
+            def __init__(self, eoi_token_id):
+                self.eoi_token_id = eoi_token_id
+                self.found_eoi = False
+                
+            def __call__(self, input_ids, scores, **kwargs):
+                # Check if EOI token is in the generated sequence
+                if self.eoi_token_id in input_ids[0].tolist():
+                    if not self.found_eoi:
+                        self.found_eoi = True
+                        print("[Emu35OfficialT2I] Found EOI token, stopping generation")
+                    return True
+                return False
+        
+        stopping_criteria = StoppingCriteriaList([StopAfterFirstImage(EOI)])
+        
+        # === Build generation config (official way) ===
+        generation_config = GenerationConfig(
+            **cfg.sampling_params,
+            pad_token_id=PAD,
+            eos_token_id=EOS,
+        )
+        
+        # Fix for transformers 4.50+: ensure model has a generation_config
+        if model.generation_config is None:
+            model.generation_config = GenerationConfig(
+                bos_token_id=BOS,
+                eos_token_id=EOS,
+                pad_token_id=PAD,
+            )
+            print("[Emu35OfficialT2I] Created default generation_config for model")
+        
+        # === Generate with progress tracking ===
+        print("[Emu35OfficialT2I] Starting generation...")
+        print(f"[Emu35OfficialT2I] generation_config.max_new_tokens={generation_config.max_new_tokens}")
+        
+        # Create a streamer for progress updates
+        # For a 55x73 image: 55 rows * (73 visual tokens + 1 EOL) + BOI + IMG + dimensions + EOI ≈ 4100 tokens
+        expected_tokens = target_height * (target_width + 1) + 50  # visual tokens + overhead
+        streamer = ThrottledStreamer(expected_tokens)
+        
+        import time
+        start_time = time.time()
+        
+        with torch.no_grad():
+            outputs = model.generate(
+                input_ids,
+                generation_config=generation_config,
+                logits_processor=logits_processor,
+                streamer=streamer,
+                stopping_criteria=stopping_criteria,
+            )
+        
+        # After generation completes
+        end_time = time.time()
+        generation_time = end_time - start_time
+        print(f"Generation complete. Output shape: {outputs.shape}")
+        print(f"[PERFORMANCE] Generation took {generation_time:.2f} seconds")
+        print(f"[PERFORMANCE] Tokens/second: {outputs.shape[1] / generation_time:.2f}")
+
+        # ============== TOKEN ANALYSIS ==============
+        print("\n" + "="*80)
+        print("TOKEN ANALYSIS:")
+        all_tokens = outputs[0].tolist()
+        print(f"Total tokens: {len(all_tokens)}")
+        print(f"Generated tokens: {len(all_tokens) - input_ids.shape[1]}")
+
+        # Check for special tokens
+        # BOI, EOI, IMG, EOL already defined above
+        has_boi = BOI in all_tokens
+        has_eoi = EOI in all_tokens
+        print(f"Has BOI: {has_boi}, Has EOI: {has_eoi}")
+
+        if has_boi and has_eoi:
+            boi_idx = all_tokens.index(BOI)
+            eoi_idx = all_tokens.index(EOI)
+            
+            # Show tokens after BOI (should be resolution + IMG)
+            context = all_tokens[boi_idx:min(boi_idx+20, len(all_tokens))]
+            context_str = tokenizer.decode(torch.tensor(context), skip_special_tokens=False)
+            print(f"After BOI: {context_str}")
+            
+            # Count visual tokens (>= 151854)
+            visual_tokens = [t for t in all_tokens[boi_idx+1:eoi_idx] if t >= 151854]
+            print(f"Visual tokens found: {len(visual_tokens)}")
+            print(f"Expected: {target_height * target_width}")
+            
+            if visual_tokens:
+                # Show first 10 visual token INDICES (subtract 151854)
+                first_10_indices = [t - 151854 for t in visual_tokens[:10]]
+                max_index = max([t - 151854 for t in visual_tokens])
+                print(f"First 10 indices: {first_10_indices}")
+                print(f"Max index: {max_index}")
+                
+                # Check if any indices are out of VQ codebook range
+                if hasattr(vq_model, 'quantize') and hasattr(vq_model.quantize, 'n_embed'):
+                    n_embed = vq_model.quantize.n_embed
+                    print(f"VQ codebook size: {n_embed}")
+                    if max_index >= n_embed:
+                        print(f"  ⚠️  WARNING: Max index ({max_index}) >= codebook size ({n_embed})!")
+        else:
+            print("  ⚠️  ERROR: Missing BOI or EOI tokens!")
+
+        print("="*80 + "\n")
+        # ============== END TOKEN ANALYSIS ==============
+        
+        # === Free model memory before decoding ===
+        print("[Emu35OfficialT2I] Freeing model memory for VQ decode...")
+        del logits_processor
+        
+        # Move model to CPU to free VRAM for VQ decode
+        # Note: This modifies the model in-place, user will need to reload
+        model.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        mem_after = torch.cuda.memory_allocated() / 1024**3
+        print(f"[Emu35OfficialT2I] GPU memory after cleanup: {mem_after:.2f} GB")
+        
+        # === Decode output using OFFICIAL multimodal_decode ===
+        output_text = tokenizer.decode(outputs[0], skip_special_tokens=False)
+        print(f"[Emu35OfficialT2I] Decoded output length: {len(output_text)}")
+        
+        # Use the official multimodal_decode function from the repo
+        try:
+            mm_output = multimodal_decode(output_text, tokenizer, vq_model)
+            print(f"[Emu35OfficialT2I] multimodal_decode returned {len(mm_output)} items")
+            
+            # Extract image, text, and reasoning (CoT) from multimodal output
+            image = None
+            text_response = ""
+            reasoning = ""
+            for item_type, item_data in mm_output:
+                print(f"[Emu35OfficialT2I] Found item type: {item_type}")
+                if item_type == "image" and item_data is not None:
+                    # item_data is a PIL Image from official decode_image
+                    print(f"[Emu35OfficialT2I] PIL Image size: {item_data.size}, mode: {item_data.mode}")
+                    img_np = np.array(item_data).astype(np.float32) / 255.0
+                    print(f"[Emu35OfficialT2I] numpy array shape: {img_np.shape}, dtype: {img_np.dtype}")
+                    image = torch.from_numpy(img_np).unsqueeze(0)
+                    print(f"[Emu35OfficialT2I] Output tensor shape: {image.shape} (should be [1, H, W, 3])")
+                elif item_type == "text":
+                    text_response += item_data
+                elif item_type == "global_cot":
+                    reasoning += f"[Global] {item_data}\n"
+                elif item_type == "image_cot":
+                    reasoning += f"[Image] {item_data}\n"
+            
+            if image is not None:
+                return (image, text_response, reasoning)
+                    
+            print("[Emu35OfficialT2I] ERROR: No image found in multimodal_decode output")
+        except Exception as e:
+            print(f"[Emu35OfficialT2I] ERROR in multimodal_decode: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Return empty image on failure (match target size)
+        pixel_height, pixel_width = target_height * 16, target_width * 16
+        empty_img = torch.zeros(1, pixel_height, pixel_width, 3)
+        return (empty_img, "", "")
+
+
 NODE_CLASS_MAPPINGS = {
     "Emu35Loader": Emu35Loader,
     "Emu35Sampler": Emu35Sampler,
     "Emu35VQA": Emu35VQA,
     "Emu35ClearCache": Emu35ClearCache,
+    "Emu35OfficialT2I": Emu35OfficialT2I,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1209,4 +1395,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Emu35Sampler": "Emu 3.5 Sampler",
     "Emu35VQA": "Emu 3.5 VQA",
     "Emu35ClearCache": "Emu 3.5 Clear Cache",
+    "Emu35OfficialT2I": "Emu 3.5 Official T2I (Auto Size)",
 }

@@ -21,6 +21,7 @@ ENV/
 test_output/
 generated_images/
 *.png
+!assets/
 *.jpg
 *.jpeg
 *.pb
@@ -28,6 +29,7 @@ generated_images/
 # IDE
 .vscode/
 .idea/
+.history/
 *.swp
 *.swo
 *~
@@ -45,3 +47,10 @@ logs/
 *.tmp
 *.temp
 temp/
+
+# Development/test files
+dev/
+
+# Workspace files
+*.code-workspace
+

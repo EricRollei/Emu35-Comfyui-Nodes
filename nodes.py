@@ -118,7 +118,10 @@ class Emu35Loader:
             "required": {
                 "model_name": (available_folders,),
                 "vq_model_name": (available_folders, {"default": "vision_tokenizer" if "vision_tokenizer" in available_folders else available_folders[0]}),
-                "precision": (["bf16", "fp16", "fp32", "nf4"], {"default": "bf16"}),
+                # "auto" = detect from config (use for pre-quantized NF4 models from HuggingFace)
+                # "bf16/fp16/fp32" = load in that precision (for full-precision models)
+                # "nf4 (quantize)" = quantize on-the-fly during loading (for full-precision models)
+                "precision": (["auto", "bf16", "fp16", "fp32", "nf4 (quantize)"], {"default": "auto"}),
             },
         }
 
@@ -128,6 +131,8 @@ class Emu35Loader:
     CATEGORY = "Emu3.5"
 
     def load_model(self, model_name, vq_model_name, precision):
+        import json
+        
         # Resolve paths
         # We assume the user selected a folder name from the dropdown
         # We need to find which root path contains this folder
@@ -150,9 +155,46 @@ class Emu35Loader:
             raise ValueError(f"Could not find VQ folder: {vq_model_name}")
 
         device = comfy.model_management.get_torch_device()
-        dtype = torch.bfloat16 if precision == "bf16" else torch.float16 if precision == "fp16" else torch.float32
 
-        print(f"Loading Emu3.5 model from {model_path} with precision {precision}...")
+        # Check if model is pre-quantized by reading config.json
+        config_path = os.path.join(model_path, "config.json")
+        is_pre_quantized = False
+        pre_quant_config = None
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config_json = json.load(f)
+                if "quantization_config" in config_json:
+                    is_pre_quantized = True
+                    pre_quant_config = config_json["quantization_config"]
+                    print(f"✓ Detected pre-quantized model: {pre_quant_config.get('quant_method', 'unknown')} / {pre_quant_config.get('bnb_4bit_quant_type', 'unknown')}")
+
+        # Determine actual loading strategy
+        if precision == "auto":
+            if is_pre_quantized:
+                print(f"Auto-detected: Loading pre-quantized {pre_quant_config.get('bnb_4bit_quant_type', 'NF4')} model")
+                load_mode = "pre_quantized"
+                dtype = torch.bfloat16  # Compute dtype for pre-quantized
+            else:
+                print("Auto-detected: Loading as bf16 (no quantization_config found)")
+                load_mode = "bf16"
+                dtype = torch.bfloat16
+        elif precision == "nf4 (quantize)":
+            if is_pre_quantized:
+                print("⚠️  Warning: Model appears to already be quantized. Loading as pre-quantized instead of re-quantizing.")
+                load_mode = "pre_quantized"
+                dtype = torch.bfloat16
+            else:
+                load_mode = "quantize_nf4"
+                dtype = torch.bfloat16
+        else:
+            # bf16, fp16, fp32
+            load_mode = precision
+            dtype = torch.bfloat16 if precision == "bf16" else torch.float16 if precision == "fp16" else torch.float32
+
+        print(f"Loading Emu3.5 model from {model_path}")
+        print(f"  Precision setting: {precision}")
+        print(f"  Load mode: {load_mode}")
+        print(f"  Compute dtype: {dtype}")
 
         # Load Config
         try:
@@ -175,20 +217,34 @@ class Emu35Loader:
         attn_impl = "eager"
         print("Using 'eager' attention implementation (sdpa causes corruption on Blackwell GPUs)")
 
-        # Load Model
-        if precision == "nf4":
+        # Load Model based on mode
+        if load_mode == "pre_quantized":
+            # Pre-quantized model: DO NOT pass quantization_config, let it auto-detect from saved config
+            print("Loading pre-quantized model (no BitsAndBytesConfig - using saved quantization)")
+            model = Emu3ForCausalLM.from_pretrained(
+                model_path,
+                config=config,
+                device_map="cuda:0",
+                trust_remote_code=True,
+                attn_implementation=attn_impl
+            )
+            print("✓ Pre-quantized model loaded successfully")
+            
+        elif load_mode == "quantize_nf4":
+            # On-the-fly quantization of a full-precision model
+            print("Quantizing model on-the-fly with NF4...")
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=torch.bfloat16,
-                llm_int8_skip_modules=["lm_head", "embed_tokens"] # Skip head and embeddings for stability
+                llm_int8_skip_modules=["lm_head", "model.embed_tokens", "model.norm"]  # Match HF model
             )
             model = Emu3ForCausalLM.from_pretrained(
                 model_path,
                 config=config,
                 quantization_config=quantization_config,
-                device_map="cuda:0",  # Use single GPU like quantizer
+                device_map="cuda:0",
                 trust_remote_code=True,
                 attn_implementation=attn_impl
             )
@@ -213,6 +269,7 @@ class Emu35Loader:
                 else:
                     print(f"  ✓ lm_head correctly preserved (not quantized)")
         else:
+            # Standard precision loading (bf16, fp16, fp32)
             model = Emu3ForCausalLM.from_pretrained(
                 model_path,
                 config=config,
@@ -1225,11 +1282,14 @@ class Emu35OfficialT2I:
                 self.found_eoi = False
                 
             def __call__(self, input_ids, scores, **kwargs):
-                # Check if EOI token is in the generated sequence
-                if self.eoi_token_id in input_ids[0].tolist():
-                    if not self.found_eoi:
-                        self.found_eoi = True
-                        print("[Emu35OfficialT2I] Found EOI token, stopping generation")
+                # Early return if we already found EOI (avoids repeated checks)
+                if self.found_eoi:
+                    return True
+                # GPU-native check - no expensive copy to CPU
+                # This is called ~4000+ times during generation, so avoiding .tolist() is critical
+                if (input_ids[0] == self.eoi_token_id).any().item():
+                    self.found_eoi = True
+                    print("[Emu35OfficialT2I] Found EOI token, stopping generation")
                     return True
                 return False
         

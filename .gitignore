@@ -21,10 +21,13 @@ ENV/
 test_output/
 generated_images/
 *.png
-!assets/
 *.jpg
 *.jpeg
 *.pb
+
+# Keep assets folder images
+!assets/*.png
+!assets/*.jpg
 
 # IDE
 .vscode/

@@ -1,0 +1,85 @@
+[project]
+name = "comfyui-emu35-nodes"
+version = "0.1.0"
+description = "ComfyUI custom nodes for BAAI's Emu3.5 multimodal models - text-to-image generation"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "EricRollei"}
+]
+keywords = [
+    "comfyui",
+    "emu3",
+    "emu3.5",
+    "text-to-image",
+    "multimodal",
+    "ai",
+    "image-generation"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "transformers>=4.45.0",
+    "torch>=2.0.0",
+    "pillow>=10.0.0",
+    "safetensors>=0.4.0",
+    "accelerate>=0.20.0",
+    "bitsandbytes>=0.43.0",
+    "sentencepiece>=0.1.99",
+    "protobuf>=3.20.0",
+    "einops>=0.6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/EricRollei/Emu35-Comfyui-Nodes"
+Repository = "https://github.com/EricRollei/Emu35-Comfyui-Nodes"
+Issues = "https://github.com/EricRollei/Emu35-Comfyui-Nodes/issues"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["emu35"]
+package-dir = {"emu35" = "."}
+
+[tool.setuptools.package-data]
+emu35 = ["*.py", "assets/*"]
+
+# ComfyUI Registry metadata
+# https://docs.comfy.org/registry/overview
+[tool.comfy]
+PublisherId = "EricRollei"
+DisplayName = "Emu3.5 Nodes"
+Icon = ""
+Description = "ComfyUI nodes for BAAI's Emu3.5 multimodal models - text-to-image generation and multimodal understanding"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]  # Line too long - handled by formatter
+
+[tool.black]
+line-length = 120
+target-version = ["py310", "py311", "py312"]

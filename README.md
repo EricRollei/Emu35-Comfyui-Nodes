@@ -2,22 +2,28 @@
 
 **ComfyUI integration for BAAI's Emu3.5 multimodal models**
 
-✅ **STATUS: FULLY WORKING** - T2I and X2I generation verified on December 17, 2025
+✅ **STATUS: ALL NODES FULLY WORKING** - Verified December 19, 2025
 
-![Example Output](assets/Emu35Image_2025-12-07_15-06-02_000.png)
+![Complete Workflow](assets/Emu35_complete_workflow.png)
 
 ## Overview
 
 This repository provides ComfyUI custom nodes for running BAAI's Emu3.5 models for:
 - **Text-to-Image (T2I)** - Generate images from text descriptions ✅
 - **Image Editing (X2I)** - Transform/edit existing images ✅ 
-- **Interleaved Generation** - Create stories/tutorials with text and images
-- **Visual Q&A** - Answer questions about images
+- **Interleaved Generation (Story Mode)** - Create illustrated stories with text and images ✅
+- **Visual Q&A** - Answer questions about images, OCR, image comparison ✅
+
+### Workflow Screenshots
+
+| T2I / Basic Workflow | X2I (Image Edit) | Story Mode |
+|:---:|:---:|:---:|
+| ![T2I](assets/Basic_workflow_screenshot.png) | ![X2I](assets/Emu35-X2I-workflow-screenshot.png) | ![Story](assets/Emu35_base_story_screenshot.png) |
 
 **Models Supported:**
 - Emu3.5-Image (34B params - T2I/X2I) - ✅ Working
-- Emu3.5-Base (Foundation model for interleaved generation)
-- Vision Tokenizer (VQ-VAE for image encoding/decoding)
+- Emu3.5-Base (65B params - Story/Interleaved/VQA) - ✅ Working
+- Vision Tokenizer (VQ-VAE for image encoding/decoding) - ✅ Working
 
 ## What's New (December 2025)
 
@@ -38,6 +44,16 @@ This project is built upon:
   - Authors: Emu3.5 Team, Beijing Academy of Artificial Intelligence
   - License: Apache 2.0
 
+**Development Contributors:**
+- **Eric Rollei** - ComfyUI node development and integration
+- **Claude Opus 4.5 (Anthropic)** - AI pair programming assistant for debugging, compatibility fixes, and feature implementation
+
+**Technical Contributions:**
+- Transformers 4.57+ compatibility patches (DynamicCache API changes)
+- Blackwell GPU (sm_120) eager attention workaround
+- VQA task presets and multi-image comparison support
+- Memory management and VRAM optimization
+
 All model weights and architecture remain property of BAAI under Apache 2.0 license.
 
 ## Installation
@@ -54,15 +70,14 @@ All model weights and architecture remain property of BAAI under Apache 2.0 lice
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/EricRollei/Emu35-Comfyui-Nodes.git emu35
+git clone --recursive https://github.com/EricRollei/Emu35-Comfyui-Nodes.git emu35
 cd emu35
-
-# Clone the official Emu3.5 repository as a submodule
-git clone https://github.com/baaivision/Emu3.5.git Emu3_5_repo
 
 # Install dependencies
 pip install -r requirements.txt
 ```
+
+> **Note:** The `--recursive` flag automatically clones the patched Emu3.5 submodule with transformers 4.57+ compatibility fixes.
 
 ### Method 2: Manual Download
 

@@ -67,7 +67,7 @@ emu35 = ["*.py", "assets/*"]
 # ComfyUI Registry metadata
 # https://docs.comfy.org/registry/overview
 [tool.comfy]
-PublisherId = "EricRollei"
+PublisherId = "ericrollei"
 DisplayName = "Emu3.5 Nodes"
 Icon = ""
 Description = "ComfyUI nodes for BAAI's Emu3.5 multimodal models - text-to-image generation and multimodal understanding"

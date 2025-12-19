@@ -201,19 +201,77 @@ Generate text with multiple embedded images (stories, tutorials).
 
 ---
 
-#### 5. Emu 3.5 VQA
-Visual Question Answering - ask questions about images.
+#### 5. Emu 3.5 VQA (Visual Question Answering)
+Analyze images, answer questions, describe content, and read text (OCR).
+
+**⚠️ Important:** Use the **emu35-base** model for VQA tasks, not emu35-image!
 
 | Input | Type | Description |
 |-------|------|-------------|
-| `model/tokenizer/vq_model` | - | From loader |
+| `model/tokenizer/vq_model` | - | From loader (use emu35-base) |
 | `image` | image | Image to analyze |
 | `question` | string | Question about the image |
-| `max_tokens` | int | Max response length |
+| `max_tokens` | int | Max response length (default: 512) |
+| `task_type` | dropdown | Preset task types (see below) |
+| `temperature` | float | Response creativity (0.1-0.3 for accuracy, 0.5-0.7 for creativity) |
+| `image2` | image | Optional second image for comparison tasks |
 
 | Output | Type | Description |
 |--------|------|-------------|
-| `ANSWER` | string | Model's answer |
+| `response` | string | Model's answer |
+
+**Task Types:**
+
+| Task Type | Description | Best For |
+|-----------|-------------|----------|
+| `caption` | One-sentence summary | Quick descriptions |
+| `describe` | Detailed description of subjects, background, colors, composition | Comprehensive analysis |
+| `analyze` | Context, mood, artistic style analysis | Art/photo critique |
+| `ocr` | Read and transcribe text from images | Screenshots, signs, documents |
+| `question` | Free-form Q&A | Specific questions |
+| `custom` | Use your own question directly | Any task |
+
+**Example Questions for VQA:**
+
+*Basic Understanding:*
+- "Describe this image in detail."
+- "What is the main subject of this image?"
+- "What colors are dominant in this image?"
+
+*Object Identification:*
+- "What objects are visible in this image?"
+- "Is there a person in this image? What are they doing?"
+- "What type of animal is in the photo?"
+
+*Counting & Spatial:*
+- "How many people are in this image?"
+- "What is to the left of the car?"
+- "Where is the sun in this scene?"
+
+*OCR (Text Reading):*
+- "What text appears in this image?"
+- "Read the sign in the background."
+- "What does the label say?"
+
+*Analysis & Style:*
+- "What artistic style is this image?"
+- "What time of day is shown?"
+- "What emotion does this scene convey?"
+- "Is this image indoor or outdoor?"
+
+*Comparison (with 2 images):*
+- "What's different between these two images?"
+- "Which image shows more people?"
+- "Compare the lighting in both photos."
+
+**Tips for Best Results:**
+
+1. **Use emu35-base model** - The Image model is optimized for generation, not understanding
+2. **Lower temperature (0.1-0.3)** for factual answers like counting, OCR, or identification
+3. **Higher temperature (0.5-0.7)** for creative descriptions or artistic analysis
+4. **Be specific** - "What brand is the laptop?" works better than "What's in the image?"
+5. **For OCR**, use task_type="ocr" which has an optimized prompt
+6. **For comparisons**, connect both images (image + image2)
 
 ---
 

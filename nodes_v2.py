@@ -41,6 +41,36 @@ from transformers import (
 from transformers.generation.streamers import BaseStreamer
 
 # =============================================================================
+# CRITICAL: Patch DynamicCache BEFORE importing Emu3.5 modules
+# Transformers 4.50+ removed 'seen_tokens' attribute from DynamicCache
+# The Emu3 model code expects this attribute to exist
+# =============================================================================
+try:
+    from transformers.cache_utils import DynamicCache
+    
+    # Patch 1: Add get_usable_length if missing (removed in newer transformers)
+    if not hasattr(DynamicCache, "get_usable_length"):
+        def _get_usable_length(self, input_seq_length, layer_idx=None):
+            # Call get_seq_length without layer_idx if it's None
+            if layer_idx is not None:
+                return self.get_seq_length(layer_idx)
+            else:
+                return self.get_seq_length()
+        DynamicCache.get_usable_length = _get_usable_length
+        print("[Emu35] Patched DynamicCache.get_usable_length")
+    
+    # Patch 2: Add seen_tokens property if missing (removed in newer transformers)
+    if not hasattr(DynamicCache, "seen_tokens"):
+        @property
+        def _seen_tokens(self):
+            return self.get_seq_length()
+        DynamicCache.seen_tokens = _seen_tokens
+        print("[Emu35] Patched DynamicCache.seen_tokens")
+        
+except ImportError as e:
+    print(f"[Emu35] Warning: Could not patch DynamicCache: {e}")
+
+# =============================================================================
 # Setup paths and imports
 # =============================================================================
 
@@ -412,7 +442,9 @@ def get_emu_subfolders() -> List[str]:
             for item in os.listdir(path):
                 item_path = os.path.join(path, item)
                 if os.path.isdir(item_path):
-                    subfolders.append(item)
+                    # Skip hidden folders (start with .) and offload cache
+                    if not item.startswith('.') and 'offload_cache' not in item.lower():
+                        subfolders.append(item)
     return sorted(list(set(subfolders)))
 
 
@@ -578,12 +610,19 @@ class Emu35LoaderV2:
         if vq_path is None:
             raise ValueError(f"Could not find VQ folder: {vq_model_name}")
 
-        # Determine device
+        # Determine device and device_map
         if device == "auto":
-            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+            # Use accelerate's auto placement which handles multi-GPU splitting
+            llm_device_map = "auto"
+            # For operations requiring a specific device (like VQ or initial tensor creation), use cuda:0
+            execution_device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        else:
+            # User forced a specific device
+            llm_device_map = {"": device}
+            execution_device = device
         
         if vq_device == "same":
-            vq_device = device
+            vq_device = execution_device
 
         # Check for pre-quantized model
         config_path = os.path.join(model_path, "config.json")
@@ -607,28 +646,35 @@ class Emu35LoaderV2:
             dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 
         print(f"Loading Emu3.5 model: {model_name}")
-        print(f"  Device: {device}, VQ Device: {vq_device}")
+        print(f"  Device Selection: {device} -> Map: {llm_device_map}")
+        print(f"  Execution Device: {execution_device}, VQ Device: {vq_device}")
         print(f"  Precision: {precision} -> {load_mode}")
 
-        # Load Config
+        # Load Config - use LOCAL Emu3Config to avoid HuggingFace cache
         try:
-            config = Emu3Config.from_pretrained(model_path, trust_remote_code=True)
+            config = Emu3Config.from_pretrained(model_path)
             from transformers import AutoConfig
             AutoConfig.register("Emu3", Emu3Config)
-        except Exception:
+        except Exception as e:
+            print(f"Warning: Could not load Emu3Config ({e}), trying AutoConfig...")
             from transformers import AutoConfig
             config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
         # Use eager attention (sdpa has issues on Blackwell)
         attn_impl = "eager"
 
+        # Check if this is a sharded model (multiple safetensors files)
+        safetensors_files = [f for f in os.listdir(model_path) if f.endswith('.safetensors')]
+        is_sharded = len(safetensors_files) > 1
+        print(f"  Sharded model: {is_sharded} ({len(safetensors_files)} files)")
+        
         # Load Model
         if load_mode == "pre_quantized":
             model = Emu3ForCausalLM.from_pretrained(
                 model_path,
                 config=config,
-                device_map=device,
-                trust_remote_code=True,
+                torch_dtype=torch.bfloat16,
+                device_map=llm_device_map,
                 attn_implementation=attn_impl
             )
         elif load_mode == "quantize_nf4":
@@ -643,21 +689,290 @@ class Emu35LoaderV2:
                 model_path,
                 config=config,
                 quantization_config=quantization_config,
-                device_map=device,
-                trust_remote_code=True,
+                device_map=llm_device_map,
                 attn_implementation=attn_impl
             )
         else:
-            model = Emu3ForCausalLM.from_pretrained(
-                model_path,
-                config=config,
-                torch_dtype=dtype,
-                device_map=device,
-                trust_remote_code=True,
-                attn_implementation=attn_impl
-            )
+            # Full-precision load (BF16/FP32)
+            # Hybrid Strategy: Use Manual Patching for 'base' model, Simple Load for others (Image)
+            
+            is_base_model = "base" in model_name.lower()
+            
+            if not is_base_model:
+                # --- SIMPLE STRATEGY (V1 Style) for Image Model ---
+                print(f"  Loading model from: {model_path}")
+                print(f"  Using Local Emu3ForCausalLM (no HuggingFace cache)")
+                
+                # Use LOCAL Emu3ForCausalLM to avoid HuggingFace cache issues
+                model = Emu3ForCausalLM.from_pretrained(
+                    model_path,
+                    config=config,
+                    torch_dtype=dtype,
+                    device_map=llm_device_map,
+                    attn_implementation=attn_impl
+                )
+                
+                # Note: DynamicCache patches are now applied at module load time (top of file)
+                # We still patch prepare_inputs_for_generation as a safety measure
+                import types
+                def patched_prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
+                    if past_key_values:
+                        if hasattr(past_key_values, "get_seq_length"):
+                            past_length = past_key_values.get_seq_length()
+                        elif hasattr(past_key_values, "seen_tokens"):
+                            past_length = past_key_values.seen_tokens
+                        else:
+                            past_length = past_key_values[0][0].shape[2]
+                    else:
+                        past_length = 0
+
+                    if past_length > 0:
+                        input_ids = input_ids[:, past_length:]
+
+                    position_ids = kwargs.get("position_ids", None)
+                    if attention_mask is not None and position_ids is None:
+                        position_ids = attention_mask.long().cumsum(-1) - 1
+                        position_ids.masked_fill_(attention_mask == 0, 1)
+                        if past_length > 0:
+                            position_ids = position_ids[:, past_length:]
+
+                    model_inputs = {
+                        "input_ids": input_ids,
+                        "past_key_values": past_key_values,
+                        "use_cache": kwargs.get("use_cache"),
+                        "position_ids": position_ids,
+                        "attention_mask": attention_mask,
+                    }
+                    return model_inputs
+
+                # Apply patch to INSTANCE and CLASS to be safe
+                model.prepare_inputs_for_generation = types.MethodType(patched_prepare_inputs_for_generation, model)
+                if hasattr(model, "__class__"):
+                     model.__class__.prepare_inputs_for_generation = patched_prepare_inputs_for_generation
+                
+                print("  ✓ Applied 'seen_tokens' compatibility patch (Image Model)")
+                
+            else:
+                # --- MANUAL PATCHING STRATEGY for Base Model ---
+                print(f"  Loading model from: {model_path}")
+                print(f"  Using Manual Patching Strategy (init_empty_weights + manual fix) for Base model")
+
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                try:
+                    from accelerate import load_checkpoint_in_model, init_empty_weights
+                    from safetensors.torch import load_file
+                except ImportError:
+                    raise ImportError("accelerate and safetensors are required. Please install them.")
+
+                # 1. Get Config and Class
+                config = Emu3Config.from_pretrained(model_path)
+                # Force eager attention
+                config._attn_implementation = attn_impl
+                
+                # 2. Init Empty Model
+                print("  Initializing empty model structure...")
+                with init_empty_weights():
+                    # Use LOCAL Emu3ForCausalLM to avoid HuggingFace cache
+                    model = Emu3ForCausalLM(config)
+                
+                # 3. Load Checkpoint via Accelerate
+                if is_sharded:
+                    checkpoint_path = model_path
+                else:
+                    files = [f for f in os.listdir(model_path) if f.endswith(".safetensors") or f.endswith(".bin")]
+                    checkpoint_path = os.path.join(model_path, files[0])
+
+                print(f"  Loading weights via accelerate from {checkpoint_path}...")
+                load_checkpoint_in_model(
+                    model,
+                    checkpoint_path,
+                    device_map=llm_device_map,
+                    dtype=dtype
+                )
+                
+                # 4. Manual Patching of Missing Weights
+                meta_params = [name for name, param in model.named_parameters() if param.device.type == 'meta']
+                
+                if meta_params:
+                    print(f"  WARNING: {len(meta_params)} parameters still on meta device. Attempting manual patch...")
+                    
+                    from safetensors import safe_open
+                    
+                    # Build a fresh index for the missing parameters only
+                    print("  Scanning safetensors files to locate missing weights...")
+                    found_weights = {} # name -> filename
+                    
+                    safetensors_files = [f for f in os.listdir(model_path) if f.endswith(".safetensors")]
+                    
+                    for fname in safetensors_files:
+                        fpath = os.path.join(model_path, fname)
+                        try:
+                            with safe_open(fpath, framework="pt") as f:
+                                file_keys = set(f.keys())
+                                
+                            for name in meta_params:
+                                if name in found_weights:
+                                    continue
+                                    
+                                # Check exact match
+                                if name in file_keys:
+                                    found_weights[name] = fname
+                                    continue
+                                    
+                                # Check with/without 'model.' prefix
+                                if name.startswith("model."):
+                                    short_name = name[6:]
+                                    if short_name in file_keys:
+                                        found_weights[name] = fname
+                                        continue
+                                else:
+                                    long_name = f"model.{name}"
+                                    if long_name in file_keys:
+                                        found_weights[name] = fname
+                                        continue
+                                        
+                        except Exception as e:
+                            print(f"    Error scanning {fname}: {e}")
+
+                    # Group by file for efficient loading
+                    params_by_file = {}
+                    for name, fname in found_weights.items():
+                        if fname not in params_by_file:
+                            params_by_file[fname] = []
+                        params_by_file[fname].append(name)
+                    
+                    # Report still missing
+                    still_missing = set(meta_params) - set(found_weights.keys())
+                    if still_missing:
+                        print(f"  ERROR: Could not find {len(still_missing)} weights in any file: {list(still_missing)[:5]}...")
+
+                    # Load and patch
+                    for fname, names in params_by_file.items():
+                        fpath = os.path.join(model_path, fname)
+                        print(f"    Patching {len(names)} weights from {fname}...")
+                        
+                        try:
+                            # Load shard
+                            state_dict = load_file(fpath)
+                            keys_in_file = set(state_dict.keys())
+                            
+                            for name in names:
+                                # Determine the key used in the file
+                                target_key = name
+                                if target_key not in keys_in_file:
+                                    if name.startswith("model.") and name[6:] in keys_in_file:
+                                        target_key = name[6:]
+                                    elif f"model.{name}" in keys_in_file:
+                                        target_key = f"model.{name}"
+                                
+                                if target_key in state_dict:
+                                    # Move to device and cast
+                                    tensor = state_dict[target_key].to(device=execution_device, dtype=dtype)
+                                    
+                                    # Find the parameter object
+                                    if "." in name:
+                                        module_path, param_name = name.rsplit(".", 1)
+                                        submod = model.get_submodule(module_path)
+                                    else:
+                                        submod = model
+                                        param_name = name
+                                    
+                                    # Get original param to check requires_grad
+                                    param = getattr(submod, param_name)
+                                    
+                                    # Create new parameter on device
+                                    new_param = torch.nn.Parameter(tensor, requires_grad=param.requires_grad)
+                                    setattr(submod, param_name, new_param)
+                                    
+                                else:
+                                    print(f"      Error: {name} (target: {target_key}) not found in {fname}")
+                            
+                            del state_dict
+                        except Exception as e:
+                            print(f"    Error patching from {fname}: {e}")
+                        
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                # Tie weights
+                model.tie_weights()
+                
+                # Note: DynamicCache patches are now applied at module load time (top of file)
+                # Patch prepare_inputs_for_generation for compatibility
+                import types
+                def patched_prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None, **kwargs):
+                    # This is a simplified version of what Emu3 likely expects, adapted for newer transformers
+                    if past_key_values:
+                        if hasattr(past_key_values, "get_seq_length"):
+                            past_length = past_key_values.get_seq_length()
+                        elif hasattr(past_key_values, "seen_tokens"):
+                            past_length = past_key_values.seen_tokens
+                        else:
+                            past_length = past_key_values[0][0].shape[2]
+                    else:
+                        past_length = 0
+
+                    # Standard logic from here (simplified for Emu3 context)
+                    if past_length > 0:
+                        input_ids = input_ids[:, past_length:]
+
+                    position_ids = kwargs.get("position_ids", None)
+                    if attention_mask is not None and position_ids is None:
+                        # create position_ids on the fly for batch generation
+                        position_ids = attention_mask.long().cumsum(-1) - 1
+                        position_ids.masked_fill_(attention_mask == 0, 1)
+                        if past_length > 0:
+                            position_ids = position_ids[:, past_length:]
+
+                    model_inputs = {
+                        "input_ids": input_ids,
+                        "past_key_values": past_key_values,
+                        "use_cache": kwargs.get("use_cache"),
+                        "position_ids": position_ids,
+                        "attention_mask": attention_mask,
+                    }
+                    return model_inputs
+
+                # Apply the patch to the model instance AND CLASS
+                model.prepare_inputs_for_generation = types.MethodType(patched_prepare_inputs_for_generation, model)
+                if hasattr(model, "__class__"):
+                     model.__class__.prepare_inputs_for_generation = patched_prepare_inputs_for_generation
+                
+                print("  ✓ Applied 'seen_tokens' compatibility patch")
+
+            # Inject GenerationMixin
+            from transformers.generation.utils import GenerationMixin
+            if not isinstance(model, GenerationMixin):
+                print("  Injecting GenerationMixin into model...")
+                model.__class__.__bases__ = (GenerationMixin,) + model.__class__.__bases__
+            
+            # Config
+            if model.generation_config is None:
+                try:
+                    model.generation_config = GenerationConfig.from_pretrained(model_path)
+                except:
+                    model.generation_config = GenerationConfig(
+                        bos_token_id=BOS_TOKEN_ID,
+                        eos_token_id=EOS_TOKEN_ID,
+                        pad_token_id=PAD_TOKEN_ID,
+                    )
+            
+            print("  ✓ Model loaded successfully")
+
+            # Verify model loaded correctly
+            sample_param = next(model.parameters())
+            print(f"  ✓ Model loaded to: {sample_param.device}, dtype: {sample_param.dtype}")
         
         model.eval()
+        
+        # Report which device(s) the model ended up on
+        if hasattr(model, 'hf_device_map'):
+            devices_used = set(model.hf_device_map.values())
+            print(f"  Model distributed across: {devices_used}")
         
         # Enable optimizations
         if hasattr(torch, 'set_float32_matmul_precision'):
@@ -1286,7 +1601,14 @@ class Emu35X2ISampler:
 class Emu35InterleavedGenerator:
     """
     Generate interleaved text and images for stories or tutorials.
-    Requires the full Emu3.5 model (not Emu3.5-Image).
+    
+    ⚠️ IMPORTANT: This node requires the BASE Emu3.5 model, NOT Emu3.5-Image!
+    
+    - Emu3.5-Image: Trained for T2I and X2I tasks only
+    - Emu3.5 (base): Trained for interleaved text+image generation (story, howto)
+    
+    Download base model:
+        huggingface-cli download BAAI/Emu3.5 --local-dir models/emu35/Emu3.5
     """
     
     @classmethod
@@ -1328,8 +1650,21 @@ class Emu35InterleavedGenerator:
         torch.manual_seed(seed)
         device = get_model_device(model)
         
+        # Check model type - warn if using Emu3.5-Image for story/howto
+        # Emu3.5-Image is for T2I/X2I only; story/howto needs base Emu3.5
+        model_config = getattr(model, 'config', None)
+        if model_config:
+            model_name = getattr(model_config, '_name_or_path', '')
+            if 'image' in model_name.lower() or 'Image' in model_name:
+                print(f"\n[{task_type.upper()}] ⚠️  WARNING: You appear to be using Emu3.5-Image model")
+                print(f"[{task_type.upper()}] Story/HowTo generation works best with the BASE Emu3.5 model")
+                print(f"[{task_type.upper()}] The Emu3.5-Image model is optimized for T2I/X2I tasks only")
+                print(f"[{task_type.upper()}] Download base model: huggingface-cli download BAAI/Emu3.5\n")
+        
         # Get task-specific sampling params
         preset = SAMPLING_PRESETS[task_type]
+        
+        print(f"[{task_type.upper()}] max_new_tokens: {preset['max_new_tokens']}, max_images: {max_images}")
         
         # Build config
         cfg = Emu35Config(
@@ -1456,6 +1791,16 @@ class Emu35InterleavedGenerator:
 class Emu35VQA:
     """
     Visual Question Answering - describe or analyze images.
+    
+    Typical use cases:
+    - Image captioning: "Describe this image in detail."
+    - Object identification: "What objects are in this image?"
+    - Scene understanding: "What is happening in this scene?"
+    - OCR/Text reading: "What text appears in this image?"
+    - Counting: "How many people are in this image?"
+    - Spatial reasoning: "What is to the left of the car?"
+    - Style analysis: "What artistic style is this image?"
+    - Comparison: (use multiple images) "What's different between these images?"
     """
     
     @classmethod
@@ -1466,8 +1811,14 @@ class Emu35VQA:
                 "tokenizer": ("EMU_TOKENIZER",),
                 "vq_model": ("EMU_VQ",),
                 "image": ("IMAGE",),
-                "question": ("STRING", {"multiline": True, "default": "Describe this image in detail."}),
+                "task_type": (["caption", "describe", "analyze", "ocr", "question", "compare", "custom"],),
                 "max_tokens": ("INT", {"default": 512, "min": 64, "max": 2048}),
+            },
+            "optional": {
+                "question": ("STRING", {"multiline": True, "default": "", "placeholder": "Enter your question (required for 'question' and 'custom' modes)"}),
+                "temperature": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 2.0, "step": 0.1}),
+                "image_resolution": (["256x256", "384x384", "512x512"],),  # Lower res for VQA = less VRAM
+                "image2": ("IMAGE",),  # Optional second image for comparison
             }
         }
 
@@ -1476,29 +1827,102 @@ class Emu35VQA:
     FUNCTION = "answer"
     CATEGORY = "Emu3.5"
 
-    def answer(self, model, tokenizer, vq_model, image, question, max_tokens):
+    def answer(self, model, tokenizer, vq_model, image, task_type, max_tokens, 
+               question="", temperature=0.3, image_resolution="384x384", image2=None):
         device = get_model_device(model)
         
-        # Encode image
-        image_token_string = encode_reference_images([image], vq_model, tokenizer)
+        # Parse image resolution to area
+        res_map = {
+            "256x256": 256 * 256,    # 65536 - very fast, lower quality
+            "384x384": 384 * 384,    # 147456 - good balance
+            "512x512": 512 * 512,    # 262144 - higher quality
+        }
+        image_area = res_map.get(image_resolution, 384 * 384)
         
-        # Build prompt for understanding
-        template = "<|extra_203|>You are a helpful assistant. USER: {question}<|IMAGE|> ASSISTANT: "
-        full_prompt = template.format(question=question)
-        full_prompt = full_prompt.replace("<|IMAGE|>", image_token_string)
+        # Clear cache before encoding
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Encode image(s) with reduced resolution for VQA
+        num_images = 1 if image2 is None else 2
+        
+        print(f"[VQA] Encoding {num_images} image(s) at {image_resolution}...")
+        
+        # For multi-image, encode separately and label them
+        if num_images == 2:
+            image1_tokens = encode_reference_images([image], vq_model, tokenizer, image_area=image_area)
+            image2_tokens = encode_reference_images([image2], vq_model, tokenizer, image_area=image_area)
+            # Create labeled image tokens
+            labeled_image_string = f"[First Image:] {image1_tokens} [Second Image:] {image2_tokens}"
+            print(f"[VQA] Multi-image mode: Using labeled image tokens")
+        else:
+            labeled_image_string = encode_reference_images([image], vq_model, tokenizer, image_area=image_area)
+        
+        # Clear cache after encoding
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Build task-specific prompts
+        if num_images == 1:
+            task_prompts = {
+                "caption": "Provide a one-sentence caption for this image.",
+                "describe": "Describe this image in detail, including the main subjects, background, colors, and overall composition.",
+                "analyze": "Analyze this image thoroughly. Describe what you see, the context, mood, and any notable details.",
+                "ocr": "Read and transcribe all text visible in this image.",
+                "question": question,  # Use user's question directly
+                "compare": "Describe this image in detail.",  # Fallback for single image
+                "custom": question,
+            }
+        else:
+            # Multi-image prompts - be very explicit about which image is which
+            task_prompts = {
+                "caption": "You are looking at two images. The first image is labeled [First Image] and the second is labeled [Second Image]. Provide a brief caption describing both.",
+                "describe": "You are looking at two images. The first image is labeled [First Image] and the second is labeled [Second Image]. Describe what you see in each image separately.",
+                "analyze": "You are looking at two images. The first image is labeled [First Image] and the second is labeled [Second Image]. Analyze each image and explain what they show.",
+                "ocr": "You are looking at two images. Read and transcribe all text visible in both images.",
+                "question": question,
+                "compare": "You are looking at two images. The first image is labeled [First Image] and the second is labeled [Second Image]. Compare these two images: What is in the first image? What is in the second image? What are the differences?",
+                "custom": question,
+            }
+        
+        actual_question = task_prompts.get(task_type, question)
+        
+        # For 'question' and 'custom' modes, require user input
+        if task_type in ["question", "custom"]:
+            if not question.strip():
+                return ("Error: Please enter a question or prompt for 'question' or 'custom' mode.",)
+            actual_question = question
+        else:
+            # For preset tasks, append user question if they provided one
+            if question.strip():
+                actual_question = f"{actual_question} Also: {question}"
+        
+        # Official Emu3.5 template for understanding tasks
+        # Image comes FIRST, then the question - this is the proper VQA format
+        # <|extra_100|> (BSS token) signals the model to start generating
+        template = "<|extra_203|>You are a helpful assistant. USER: <|IMAGE|> {question} ASSISTANT: <|extra_100|>"
+        full_prompt = template.format(question=actual_question)
+        full_prompt = full_prompt.replace("<|IMAGE|>", labeled_image_string)
         
         # Encode
         input_ids = tokenizer.encode(full_prompt, return_tensors="pt", add_special_tokens=False).to(device)
         
-        print(f"[VQA] Processing question: {question[:50]}...")
+        print(f"[VQA] Task: {task_type}, Images: {num_images}")
+        print(f"[VQA] Question: {actual_question[:80]}...")
+        print(f"[VQA] Input tokens: {input_ids.shape[1]}")
         
-        # Generate (no CFG needed for understanding)
+        # Generate - understanding tasks use lower temperature for accuracy
+        # Include repetition penalty and no_repeat_ngram to prevent loops
         generation_config = GenerationConfig(
             max_new_tokens=max_tokens,
-            do_sample=True,
-            top_k=50,
-            top_p=0.9,
-            temperature=0.7,
+            do_sample=temperature > 0,
+            top_k=200 if temperature > 0 else 1,  # Lower top_k for understanding
+            top_p=0.8,
+            temperature=max(temperature, 0.01),  # Avoid division by zero
+            repetition_penalty=1.2,  # Penalize repeated tokens
+            no_repeat_ngram_size=3,  # Prevent 3-gram repetition (like "and, and, and")
             pad_token_id=PAD_TOKEN_ID,
             eos_token_id=EOS_TOKEN_ID,
         )
@@ -1513,14 +1937,26 @@ class Emu35VQA:
         new_tokens = outputs[:, input_ids.shape[1]:]
         response = tokenizer.decode(new_tokens[0], skip_special_tokens=True)
         
-        # Clean up response
+        # Clean up response - remove any trailing special tokens that weren't caught
         response = response.strip()
+        
+        # Remove common artifacts
+        for artifact in ["<|extra_101|>", "<|extra_100|>", "<|endoftext|>"]:
+            response = response.replace(artifact, "").strip()
+        
+        print(f"[VQA] Response length: {len(response)} chars")
+        
+        # Clean up after generation
+        del input_ids, outputs, new_tokens
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return (response,)
 
 
 # =============================================================================
-# Node: Emu35 Memory Manager
+# Node: Emu35 Memory Manager (Enhanced)
 # =============================================================================
 
 class Emu35MemoryManager:
@@ -1572,6 +2008,362 @@ class Emu35MemoryManager:
 
 
 # =============================================================================
+# Node: Emu35 VRAM Cleanup (Comprehensive)
+# =============================================================================
+
+class Emu35VRAMCleanup:
+    """
+    Comprehensive VRAM and RAM cleanup node.
+    
+    Can be wired anywhere in workflow:
+    - Before Emu35 nodes: Clean slate for generation
+    - After Emu35 nodes: Free up VRAM for other tasks
+    - Standalone: Emergency cleanup after OOM errors
+    
+    Features:
+    - Reports VRAM/RAM before and after
+    - Multiple cleanup levels (light, standard, aggressive)
+    - Can unload model weights entirely
+    - Cleans up orphaned tensors from OOM situations
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "cleanup_level": ([
+                    "light (cache only)",
+                    "standard (cache + gc)", 
+                    "aggressive (deep clean)",
+                    "nuclear (unload all models)"
+                ],),
+                "trigger": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                # Accept any input type for flexible wiring
+                "any_input": ("*",),
+                "model": ("EMU_MODEL",),
+                "vq_model": ("EMU_VQ",),
+                "unload_models": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("*", "STRING", "STRING")
+    RETURN_NAMES = ("passthrough", "status_report", "memory_diff")
+    FUNCTION = "cleanup"
+    CATEGORY = "Emu3.5"
+    OUTPUT_NODE = True
+
+    def _get_memory_stats(self) -> dict:
+        """Collect current memory statistics."""
+        import psutil
+        
+        stats = {
+            "ram_used_gb": psutil.Process().memory_info().rss / 1024**3,
+            "ram_available_gb": psutil.virtual_memory().available / 1024**3,
+            "ram_total_gb": psutil.virtual_memory().total / 1024**3,
+            "gpus": []
+        }
+        
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    allocated = torch.cuda.memory_allocated(i) / 1024**3
+                    reserved = torch.cuda.memory_reserved(i) / 1024**3
+                    total = torch.cuda.get_device_properties(i).total_memory / 1024**3
+                    free = total - reserved
+                    stats["gpus"].append({
+                        "id": i,
+                        "name": torch.cuda.get_device_properties(i).name,
+                        "allocated_gb": allocated,
+                        "reserved_gb": reserved,
+                        "free_gb": free,
+                        "total_gb": total,
+                    })
+                except Exception as e:
+                    stats["gpus"].append({"id": i, "error": str(e)})
+        
+        return stats
+
+    def _format_stats(self, stats: dict, label: str) -> str:
+        """Format memory stats as readable string."""
+        lines = [f"=== {label} ==="]
+        lines.append(f"RAM: {stats['ram_used_gb']:.2f}GB used / {stats['ram_total_gb']:.1f}GB total")
+        
+        for gpu in stats["gpus"]:
+            if "error" in gpu:
+                lines.append(f"GPU {gpu['id']}: Error - {gpu['error']}")
+            else:
+                lines.append(
+                    f"GPU {gpu['id']} ({gpu['name']}): "
+                    f"{gpu['allocated_gb']:.2f}GB allocated, "
+                    f"{gpu['reserved_gb']:.2f}GB reserved, "
+                    f"{gpu['free_gb']:.2f}GB free"
+                )
+        
+        return "\n".join(lines)
+
+    def _light_cleanup(self):
+        """Light cleanup - just clear CUDA cache."""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _standard_cleanup(self):
+        """Standard cleanup - cache + garbage collection."""
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
+    def _aggressive_cleanup(self):
+        """Aggressive cleanup - deep clean for orphaned tensors."""
+        import ctypes
+        
+        # Multiple rounds of GC
+        for _ in range(3):
+            gc.collect()
+        
+        if torch.cuda.is_available():
+            # Synchronize all devices
+            for i in range(torch.cuda.device_count()):
+                try:
+                    torch.cuda.synchronize(i)
+                except:
+                    pass
+            
+            # Clear caches
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            
+            # Reset peak memory stats
+            for i in range(torch.cuda.device_count()):
+                try:
+                    torch.cuda.reset_peak_memory_stats(i)
+                except:
+                    pass
+        
+        # Try to release Python memory back to OS
+        try:
+            if hasattr(ctypes, 'pythonapi'):
+                ctypes.pythonapi.PyMem_RawFree
+            # On Windows, try to compact heap
+            import sys
+            if sys.platform == 'win32':
+                try:
+                    ctypes.windll.kernel32.SetProcessWorkingSetSize(-1, -1, -1)
+                except:
+                    pass
+        except:
+            pass
+
+    def _nuclear_cleanup(self, model=None, vq_model=None):
+        """Nuclear option - unload models entirely."""
+        unloaded = []
+        
+        # Move models to CPU first, then delete references
+        if model is not None:
+            try:
+                model.to("cpu")
+                unloaded.append("main model → CPU")
+            except Exception as e:
+                unloaded.append(f"main model: error {e}")
+        
+        if vq_model is not None:
+            try:
+                vq_model.to("cpu")
+                unloaded.append("VQ model → CPU")
+            except Exception as e:
+                unloaded.append(f"VQ model: error {e}")
+        
+        # Aggressive cleanup after moving
+        self._aggressive_cleanup()
+        
+        return unloaded
+
+    def cleanup(
+        self, 
+        cleanup_level: str,
+        trigger: bool,
+        any_input=None,
+        model=None, 
+        vq_model=None,
+        unload_models: bool = False,
+    ):
+        # Get before stats
+        before_stats = self._get_memory_stats()
+        before_report = self._format_stats(before_stats, "BEFORE CLEANUP")
+        
+        print(f"\n[VRAM Cleanup] Level: {cleanup_level}")
+        print(before_report)
+        
+        # Only run if triggered
+        if not trigger:
+            return (any_input, "Cleanup skipped (trigger=False)", "No change")
+        
+        unloaded_info = []
+        
+        # Perform cleanup based on level
+        if "light" in cleanup_level:
+            self._light_cleanup()
+        elif "standard" in cleanup_level:
+            self._standard_cleanup()
+        elif "aggressive" in cleanup_level:
+            self._aggressive_cleanup()
+        elif "nuclear" in cleanup_level:
+            unloaded_info = self._nuclear_cleanup(model, vq_model)
+        
+        # Additional model unload if requested
+        if unload_models and "nuclear" not in cleanup_level:
+            unloaded_info = self._nuclear_cleanup(model, vq_model)
+        
+        # Get after stats
+        after_stats = self._get_memory_stats()
+        after_report = self._format_stats(after_stats, "AFTER CLEANUP")
+        
+        # Calculate diff
+        diff_lines = ["=== MEMORY FREED ==="]
+        ram_freed = before_stats["ram_used_gb"] - after_stats["ram_used_gb"]
+        diff_lines.append(f"RAM: {ram_freed:+.2f}GB")
+        
+        for i, (before_gpu, after_gpu) in enumerate(zip(before_stats["gpus"], after_stats["gpus"])):
+            if "error" not in before_gpu and "error" not in after_gpu:
+                alloc_freed = before_gpu["allocated_gb"] - after_gpu["allocated_gb"]
+                reserved_freed = before_gpu["reserved_gb"] - after_gpu["reserved_gb"]
+                diff_lines.append(
+                    f"GPU {i}: {alloc_freed:+.2f}GB allocated, {reserved_freed:+.2f}GB reserved"
+                )
+        
+        if unloaded_info:
+            diff_lines.append("Models unloaded: " + ", ".join(unloaded_info))
+        
+        diff_report = "\n".join(diff_lines)
+        
+        # Full status report
+        status_report = f"{before_report}\n\n{after_report}\n\n{diff_report}"
+        
+        print(after_report)
+        print(diff_report)
+        print("[VRAM Cleanup] Complete\n")
+        
+        return (any_input, status_report, diff_report)
+
+
+# =============================================================================
+# Node: Emu35 Emergency Reset
+# =============================================================================
+
+class Emu35EmergencyReset:
+    """
+    Emergency reset node for recovering from OOM or stuck states.
+    
+    This node attempts to:
+    1. Find and clean up orphaned tensors
+    2. Reset CUDA contexts
+    3. Force garbage collection
+    4. Clear all caches
+    
+    Use after OOM errors or when VRAM appears stuck.
+    """
+    
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "confirm_reset": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "target_gpu": ("INT", {"default": 0, "min": 0, "max": 7}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("reset_log",)
+    FUNCTION = "emergency_reset"
+    CATEGORY = "Emu3.5"
+    OUTPUT_NODE = True
+
+    def emergency_reset(self, confirm_reset: bool, target_gpu: int = 0):
+        if not confirm_reset:
+            return ("Reset cancelled - set confirm_reset=True to proceed",)
+        
+        log_lines = ["=== EMERGENCY RESET INITIATED ==="]
+        log_lines.append(f"Target GPU: {target_gpu}")
+        
+        try:
+            import psutil
+            
+            # Step 1: Get initial state
+            if torch.cuda.is_available():
+                initial_alloc = torch.cuda.memory_allocated(target_gpu) / 1024**3
+                initial_reserved = torch.cuda.memory_reserved(target_gpu) / 1024**3
+                log_lines.append(f"Initial: {initial_alloc:.2f}GB alloc, {initial_reserved:.2f}GB reserved")
+            
+            # Step 2: Synchronize GPU to finish pending ops
+            log_lines.append("Step 1: Synchronizing CUDA...")
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(target_gpu)
+            log_lines.append("  ✓ CUDA synchronized")
+            
+            # Step 3: Multiple garbage collection passes
+            log_lines.append("Step 2: Aggressive garbage collection...")
+            collected_total = 0
+            for i in range(5):
+                collected = gc.collect()
+                collected_total += collected
+            log_lines.append(f"  ✓ Collected {collected_total} objects")
+            
+            # Step 4: Clear all CUDA caches
+            log_lines.append("Step 3: Clearing CUDA caches...")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                # Reset memory stats
+                torch.cuda.reset_peak_memory_stats(target_gpu)
+                torch.cuda.reset_accumulated_memory_stats(target_gpu)
+            log_lines.append("  ✓ CUDA caches cleared")
+            
+            # Step 5: Try to find orphaned tensors in globals
+            log_lines.append("Step 4: Scanning for orphaned tensors...")
+            orphan_count = 0
+            for obj in gc.get_objects():
+                try:
+                    if isinstance(obj, torch.Tensor) and obj.is_cuda:
+                        # Check if tensor is unreachable (no strong refs except gc)
+                        if len(gc.get_referrers(obj)) <= 1:
+                            orphan_count += 1
+                except:
+                    pass
+            log_lines.append(f"  Found {orphan_count} potentially orphaned CUDA tensors")
+            
+            # Step 6: Final GC pass
+            log_lines.append("Step 5: Final cleanup...")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # Step 7: Report final state
+            if torch.cuda.is_available():
+                final_alloc = torch.cuda.memory_allocated(target_gpu) / 1024**3
+                final_reserved = torch.cuda.memory_reserved(target_gpu) / 1024**3
+                freed_alloc = initial_alloc - final_alloc
+                freed_reserved = initial_reserved - final_reserved
+                log_lines.append(f"\n=== RESULTS ===")
+                log_lines.append(f"Final: {final_alloc:.2f}GB alloc, {final_reserved:.2f}GB reserved")
+                log_lines.append(f"Freed: {freed_alloc:.2f}GB alloc, {freed_reserved:.2f}GB reserved")
+            
+            log_lines.append("\n✓ Emergency reset complete")
+            
+        except Exception as e:
+            log_lines.append(f"\n✗ Error during reset: {type(e).__name__}: {e}")
+            import traceback
+            log_lines.append(traceback.format_exc())
+        
+        log_text = "\n".join(log_lines)
+        print(log_text)
+        return (log_text,)
+
+
+# =============================================================================
 # Node Mappings
 # =============================================================================
 
@@ -1582,6 +2374,8 @@ NODE_CLASS_MAPPINGS = {
     "Emu35InterleavedGenerator": Emu35InterleavedGenerator,
     "Emu35VQA": Emu35VQA,
     "Emu35MemoryManager": Emu35MemoryManager,
+    "Emu35VRAMCleanup": Emu35VRAMCleanup,
+    "Emu35EmergencyReset": Emu35EmergencyReset,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1591,4 +2385,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Emu35InterleavedGenerator": "Emu 3.5 Interleaved (Story/HowTo)",
     "Emu35VQA": "Emu 3.5 VQA",
     "Emu35MemoryManager": "Emu 3.5 Memory Manager",
+    "Emu35VRAMCleanup": "Emu 3.5 VRAM Cleanup",
+    "Emu35EmergencyReset": "Emu 3.5 Emergency Reset",
 }
